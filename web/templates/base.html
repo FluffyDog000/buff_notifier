@@ -13,6 +13,7 @@
   <nav>
     <a href="{{ url_for('index') }}" class="{{ 'on' if request.endpoint == 'index' }}">Обзор</a>
     <a href="{{ url_for('items') }}" class="{{ 'on' if request.endpoint == 'items' }}">Предметы</a>
+    <a href="{{ url_for('accounts_page') }}" class="{{ 'on' if request.endpoint and request.endpoint.startswith('accounts_') }}">Аккаунты</a>
     <a href="{{ url_for('settings_page') }}" class="{{ 'on' if request.endpoint in ('settings_page', 'settings_save') }}">Настройки</a>
   </nav>
   <form method="post" action="{{ url_for('logout') }}" class="inline">

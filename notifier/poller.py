@@ -45,7 +45,7 @@ def _hash(text: str) -> str:
 class Poller:
     def __init__(self, store: Store, settings_path: Path = config.SETTINGS_PATH,
                  env_path: Path = config.ENV_PATH, client_factory=buff.from_config,
-                 telegram_factory=Telegram, connect=sales.connect):
+                 telegram_factory=Telegram, connect=sales.connect, work_owner: str | None = None):
         self.store = store
         self.settings_path, self.env_path = settings_path, env_path
         self.client_factory, self.telegram_factory, self.connect = \
@@ -55,6 +55,10 @@ class Poller:
         self._pruned: datetime | None = None
         self._polls_in_a_row = 0
         self._request_finished_at: datetime | None = None
+        self.work_owner = work_owner
+
+    def context(self) -> tuple[dict, dict]:
+        return config.load_settings(self.settings_path), config.load_secrets(self.env_path)
 
     # -- helpers --------------------------------------------------------------
 
@@ -117,8 +121,7 @@ class Poller:
     def cycle(self, now: datetime | None = None) -> float:
         """Poll at most one item. Returns seconds to wait before the next cycle."""
         now = now or datetime.now(timezone.utc)
-        s = config.load_settings(self.settings_path)
-        sec = config.load_secrets(self.env_path)
+        s, sec = self.context()
         tg = self.telegram_factory(sec["TELEGRAM_BOT_TOKEN"], sec["TELEGRAM_CHAT_ID"])
         self.store.set_status("heartbeat", now_iso(now))
 
@@ -148,18 +151,34 @@ class Poller:
         pending = self.store.next_pending()
         # One search after four polls, or all requests when the watch list is empty.
         if pending and (item is None or self._polls_in_a_row >= SEARCH_EVERY):
-            self._polls_in_a_row = 0
-            self.store.set_status("state", "работает: ищу goods_id")
-            return self.resolve(pending, s, sec, tg, now, cookie)
+            if self.work_owner:
+                pending = self.store.claim_work("search", self.work_owner, now)
+            if pending:
+                self._polls_in_a_row = 0
+                self.store.set_status("state", "работает: ищу goods_id")
+                try:
+                    return self.resolve(pending, s, sec, tg, now, cookie)
+                finally:
+                    if self.work_owner:
+                        self.store.release_work("search", pending["name"], self.work_owner)
         if item is None:
             self.store.set_status("state", "работает")
             return IDLE
 
         self.prune(now)
+        if self.work_owner:
+            item = self.store.claim_work("poll", self.work_owner, now)
+            if item is None:
+                return 1.0
         self._polls_in_a_row += 1
-        self.store.advance_scan(item["goods_id"], now)
+        if not self.work_owner:
+            self.store.advance_scan(item["goods_id"], now)
         self.store.set_status("state", "работает: обход по кругу")
-        return self.poll(item, s, sec, db, tg, now, cookie)
+        try:
+            return self.poll(item, s, sec, db, tg, now, cookie)
+        finally:
+            if self.work_owner:
+                self.store.release_work("poll", str(item["goods_id"]), self.work_owner)
 
     def poll(self, item: dict, s: dict, sec: dict, db, tg: Telegram, now: datetime,
              cookie: str) -> float:
@@ -174,7 +193,7 @@ class Poller:
             self.store.polled(gid, now, 0, None, str(e))
             return 0.0
         except requests.RequestException as e:
-            self.store.polled(gid, now, 0, None, f"сеть: {e}")
+            self.store.polled(gid, now, 0, None, f"сеть: {type(e).__name__}")
             return 0.0
 
         self.store.set_status("session", "работает")
@@ -257,7 +276,7 @@ class Poller:
             self.store.fail_pending(name, str(e))
             return 0.0
         except requests.RequestException as e:
-            self.store.fail_pending(name, f"сеть: {e}")
+            self.store.fail_pending(name, f"сеть: {type(e).__name__}")
             return 0.0
         self.store.set_status("session", "работает")
         gid = buff.match_goods(body, base)

@@ -90,6 +90,24 @@ CREATE TABLE IF NOT EXISTS request_events (
 );
 CREATE INDEX IF NOT EXISTS idx_request_events_time ON request_events(at);
 CREATE INDEX IF NOT EXISTS idx_request_events_measurement ON request_events(measurement_id, at);
+CREATE TABLE IF NOT EXISTS work_claims (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    until TEXT NOT NULL,
+    PRIMARY KEY(kind, key)
+);
+CREATE TABLE IF NOT EXISTS routes (
+    key TEXT PRIMARY KEY,
+    next_at TEXT,
+    pause_until TEXT,
+    owner TEXT,
+    busy_until TEXT
+);
+CREATE TABLE IF NOT EXISTS route_aliases (
+    alias TEXT PRIMARY KEY,
+    target TEXT NOT NULL
+);
 """
 
 
@@ -105,6 +123,14 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         self.lock = threading.Lock()
+        if "account_id" not in {r[1] for r in self.conn.execute("PRAGMA table_info(measurements)")}:
+            try:
+                self.conn.execute("ALTER TABLE measurements ADD COLUMN account_id TEXT NOT NULL DEFAULT 'primary'")
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                if "account_id" not in {r[1] for r in self.conn.execute("PRAGMA table_info(measurements)")}:
+                    raise
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_measurement_account ON measurements(account_id, id)")
 
     # -- watch list ---------------------------------------------------------
 
@@ -150,6 +176,114 @@ class Store:
                 self.set_status("scan_round_seconds", str(max(0, (now - datetime.fromisoformat(started)).total_seconds())))
             self.set_status("scan_round_started", now_iso(now))
         self.set_status("scan_cursor", str(goods_id))
+
+    def claim_work(self, kind: str, owner: str, now: datetime) -> dict | None:
+        """Atomically reserve the next job across workers and SQLite connections."""
+        at, until = now_iso(now), now_iso(now + timedelta(seconds=120))
+        with self.lock, self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute("DELETE FROM work_claims WHERE until<=?", (at,))
+            if kind == "poll":
+                cursor_row = self.conn.execute("SELECT value FROM status WHERE key='scan_cursor'").fetchone()
+                cursor = int(cursor_row[0] or 0) if cursor_row else 0
+                sql = ("SELECT w.* FROM watch w WHERE active=1 AND NOT EXISTS "
+                       "(SELECT 1 FROM work_claims c WHERE c.kind='poll' AND c.key=CAST(w.goods_id AS TEXT)) ")
+                row = self.conn.execute(sql + "AND goods_id>? ORDER BY goods_id LIMIT 1", (cursor,)).fetchone()
+                if row is None:
+                    row = self.conn.execute(sql + "ORDER BY goods_id LIMIT 1").fetchone()
+                if row is None:
+                    return None
+                key = str(row["goods_id"])
+                started_row = self.conn.execute("SELECT value FROM status WHERE key='scan_round_started'").fetchone()
+                started = started_row[0] if started_row else None
+                updates = {"scan_cursor": key}
+                if not started or row["goods_id"] <= cursor:
+                    if started:
+                        updates["scan_round_seconds"] = str(max(0, (now - datetime.fromisoformat(started)).total_seconds()))
+                    updates["scan_round_started"] = at
+                self.conn.executemany(
+                    "INSERT INTO status(key,value,at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET "
+                    "value=excluded.value,at=excluded.at", [(k, v, at) for k, v in updates.items()])
+            else:
+                row = self.conn.execute(
+                    "SELECT p.* FROM pending p WHERE tries<3 AND NOT EXISTS "
+                    "(SELECT 1 FROM work_claims c WHERE c.kind='search' AND c.key=p.name) "
+                    "ORDER BY tries,added_at LIMIT 1").fetchone()
+                if row is None:
+                    return None
+                key = row["name"]
+            self.conn.execute("INSERT INTO work_claims(kind,key,owner,until) VALUES (?,?,?,?)",
+                              (kind, key, owner, until))
+            return dict(row)
+
+    def release_work(self, kind: str, key: str, owner: str) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM work_claims WHERE kind=? AND key=? AND owner=?", (kind, str(key), owner))
+
+    def acquire_route(self, key: str, owner: str, interval: float, now: datetime) -> bool:
+        at = now.isoformat(timespec="microseconds")
+        with self.lock, self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            key = self._route_key(key)
+            row = self.conn.execute("SELECT * FROM routes WHERE key=?", (key,)).fetchone()
+            if row and any(row[k] and row[k] > at for k in ("next_at", "pause_until", "busy_until")):
+                return False
+            self.conn.execute(
+                "INSERT INTO routes(key,next_at,owner,busy_until) VALUES (?,?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET next_at=excluded.next_at,owner=excluded.owner,busy_until=excluded.busy_until",
+                (key, (now + timedelta(seconds=interval)).isoformat(), owner,
+                 now_iso(now + timedelta(seconds=120))))
+            return True
+
+    def release_route(self, key: str, owner: str) -> None:
+        with self.lock, self.conn:
+            key = self._route_key(key)
+            self.conn.execute("UPDATE routes SET owner=NULL,busy_until=NULL WHERE key=? AND owner=?", (key, owner))
+
+    def pause_route(self, key: str, until: str) -> None:
+        with self.lock, self.conn:
+            key = self._route_key(key)
+            self.conn.execute(
+                "INSERT INTO routes(key,pause_until) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET "
+                "pause_until=MAX(COALESCE(routes.pause_until,''),excluded.pause_until)", (key, until))
+
+    def _route_key(self, key: str) -> str:
+        row = self.conn.execute("SELECT target FROM route_aliases WHERE alias=?", (key,)).fetchone()
+        return row[0] if row else key
+
+    def route_pause(self, key: str) -> str | None:
+        with self.lock:
+            row = self.conn.execute("SELECT pause_until FROM routes WHERE key=?", (self._route_key(key),)).fetchone()
+            return row[0] if row else None
+
+    def link_routes(self, alias: str, target: str) -> None:
+        """Retain pacing/cooldowns and in-flight ownership when an exit IP is learned."""
+        if alias == target:
+            return
+        with self.lock, self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            target = self._route_key(target)
+            if self._route_key(alias) == target:
+                return
+            old = self.conn.execute("SELECT * FROM routes WHERE key=?", (alias,)).fetchone()
+            current = self.conn.execute("SELECT * FROM routes WHERE key=?", (target,)).fetchone()
+            if old:
+                values = {k: max(old[k] or "", current[k] or "" if current else "") or None
+                          for k in ("next_at", "pause_until", "busy_until")}
+                owner = old["owner"] if not current or (old["busy_until"] or "") > (current["busy_until"] or "") else current["owner"]
+                self.conn.execute("INSERT INTO routes(key,next_at,pause_until,owner,busy_until) VALUES (?,?,?,?,?) "
+                                  "ON CONFLICT(key) DO UPDATE SET next_at=excluded.next_at,pause_until=excluded.pause_until,"
+                                  "owner=excluded.owner,busy_until=excluded.busy_until",
+                                  (target, values["next_at"], values["pause_until"], owner, values["busy_until"]))
+                self.conn.execute("DELETE FROM routes WHERE key=?", (alias,))
+            self.conn.execute("INSERT INTO route_aliases(alias,target) VALUES (?,?) "
+                              "ON CONFLICT(alias) DO UPDATE SET target=excluded.target", (alias, target))
+
+    def renew_claims(self, prefix: str, now: datetime) -> None:
+        until = now_iso(now + timedelta(seconds=120))
+        with self.lock, self.conn:
+            self.conn.execute("UPDATE work_claims SET until=? WHERE owner LIKE ?", (until, prefix + "%"))
+            self.conn.execute("UPDATE routes SET busy_until=? WHERE owner LIKE ?", (until, prefix + "%"))
 
     def polled(self, goods_id: int, now: datetime, interval_min: float,
                sales_per_day: float | None, error: str | None = None) -> None:
@@ -248,19 +382,20 @@ class Store:
     # -- passive measurement of the notifier's requests ----------------------
 
     def measurement(self, signature: str, interval_sec: float, proxy: bool,
-                    now: datetime) -> int:
+                    now: datetime, account_id: str = "primary") -> int:
         """Reuse the current run across restarts; changing its inputs starts a run.
 
         The signature is a digest. No cookies, proxy credentials or response
         bodies are stored here.
         """
         with self.lock, self.conn:
-            row = self.conn.execute("SELECT id, signature FROM measurements ORDER BY id DESC LIMIT 1").fetchone()
+            row = self.conn.execute("SELECT id, signature FROM measurements WHERE account_id=? ORDER BY id DESC LIMIT 1",
+                                    (account_id,)).fetchone()
             if row and row["signature"] == signature:
                 return row["id"]
             cur = self.conn.execute(
-                "INSERT INTO measurements(signature, started_at, interval_sec, proxy) VALUES (?,?,?,?)",
-                (signature, now_iso(now), interval_sec, int(proxy)))
+                "INSERT INTO measurements(signature, started_at, interval_sec, proxy, account_id) VALUES (?,?,?,?,?)",
+                (signature, now_iso(now), interval_sec, int(proxy), account_id))
             return cur.lastrowid
 
     def record_request(self, measurement_id: int, now: datetime, kind: str,
@@ -283,9 +418,9 @@ class Store:
                  int(outcome not in ("ok", "limited")), outcome == "limited", outcome == "limited",
                  now_iso(now), measurement_id))
 
-    def measurement_stats(self, now: datetime | None = None) -> dict:
+    def measurement_stats(self, now: datetime | None = None, account_id: str = "primary") -> dict:
         now = now or datetime.now(timezone.utc)
-        row = self.conn.execute("SELECT * FROM measurements ORDER BY id DESC LIMIT 1").fetchone()
+        row = self.conn.execute("SELECT * FROM measurements WHERE account_id=? ORDER BY id DESC LIMIT 1", (account_id,)).fetchone()
         if row is None:
             return {"current": None, "history": [], "limits": []}
         current = dict(row)
@@ -303,7 +438,7 @@ class Store:
             (current["id"], hour, now_iso(now))).fetchone())
         return {"current": current,
                 "history": [dict(r) for r in self.conn.execute(
-                    "SELECT * FROM measurements ORDER BY id DESC LIMIT 5")],
+                    "SELECT * FROM measurements WHERE account_id=? ORDER BY id DESC LIMIT 5", (account_id,))],
                 "limits": [dict(r) for r in self.conn.execute(
                     "SELECT at, http_status, retry_after, pause_seconds FROM request_events "
                     "WHERE measurement_id=? AND outcome='limited' ORDER BY id DESC LIMIT 10",
@@ -314,6 +449,14 @@ class Store:
         with self.lock, self.conn:
             self.conn.execute("DELETE FROM request_events WHERE at < ?",
                               (now_iso(now - timedelta(days=7)),))
+
+    def total_requests(self, now: datetime | None = None, minutes: float = 60) -> dict:
+        now = now or datetime.now(timezone.utc)
+        return dict(self.conn.execute(
+            "SELECT COUNT(*) AS attempts, COALESCE(SUM(outcome='ok' AND kind='poll'),0) AS polls, "
+            "COALESCE(SUM(outcome='ok' AND kind='search'),0) AS searches, "
+            "COALESCE(SUM(outcome='limited'),0) AS limited FROM request_events WHERE at>=? AND at<=?",
+            (now_iso(now - timedelta(minutes=minutes)), now_iso(now))).fetchone())
 
     # -- status ---------------------------------------------------------------
 

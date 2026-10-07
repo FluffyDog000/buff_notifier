@@ -18,7 +18,7 @@
     {% if st.csfloat_pull %}<div class="muted {{ 'err' if st.csfloat_pull.value.startswith('ошибка') }}">копия с сервера бота {{ ago(st.csfloat_pull.at) }}: {{ st.csfloat_pull.value }}</div>{% endif %}</div>
   <div class="kv"><div class="k">Нагрузка</div>
     <div class="v {{ 'err' if need > allowed else '' }}">{{ need|round|int }} запросов в сутки для обхода каждые 5 минут</div>
-    <div class="muted">{{ active }} предметов; при паузе {{ s.request_interval|round(1) }} с теоретический максимум {{ allowed|round|int }} без ограничений и других задержек</div></div>
+    <div class="muted">{{ active }} предметов; {{ account_count }} активных аккаунтов, {{ route_count }} маршрутов; теоретический максимум {{ allowed|round|int }} без ограничений и других задержек</div></div>
   {% if st.pause_until and st.pause_until.value and st.pause_until.value > (st.heartbeat.value if st.heartbeat else '') %}
   <div class="kv"><div class="k">Пауза после 429</div><div class="v warn">до {{ st.pause_until.value[11:16] }} UTC</div></div>
   {% endif %}
@@ -31,12 +31,15 @@
 <div class="card">
   <h2>Обход по кругу</h2>
   <p>Все {{ active }} активных предметов проверяются по очереди. После последнего сразу начинается новый круг. Число продаж на CSFloat не меняет частоту проверки.</p>
-  <div class="muted">При паузе {{ s.request_interval }} с минимальное время круга — {{ scan_min_minutes|round(1) }} мин. Поиск goods_id, обработка лотов, сеть и паузы после 429 увеличивают это время.</div>
-  {% if st.scan_round_seconds %}<div>Последний завершённый круг: {{ (st.scan_round_seconds.value|float / 60)|round(1) }} мин.</div>{% endif %}
+  <div class="muted">Минимальное время круга при текущих аккаунтах — {{ (scan_min_minutes|round(1) ~ ' мин') if scan_min_minutes is not none else 'нет активных сессий' }}. Поиск goods_id, обработка лотов, сеть и паузы после 429 увеличивают это время.</div>
+  <div class="row"><a href="{{ url_for('accounts_page') }}">Добавить аккаунты и посмотреть их статистику</a></div>
+  <p>Все аккаунты за последние 5 минут: {{ total_five.polls }} успешных опросов, {{ total_five.searches }} поисков, {{ total_five.limited }} ответов 429.
+    За час: {{ total_hour.polls }} опросов, {{ total_hour.searches }} поисков, {{ total_hour.limited }} ответов 429.</p>
+  {% if st.scan_round_seconds %}<div>Последний круг очереди: {{ (st.scan_round_seconds.value|float / 60)|round(1) }} мин. Завершение ответов может запаздывать при параллельном опросе.</div>{% endif %}
 </div>
 
 <div class="card" id="measurement">
-  <h2>Замер запросов и ограничений</h2>
+  <h2>Замер запросов и ограничений — основной аккаунт</h2>
   <p class="muted">Считаются запросы службы опроса: лоты и поиск goods_id. Смена сессии, прокси или паузы начинает новый замер. Проверки из настроек и командной строки сюда не входят.</p>
   {% set m = metrics.current %}
   {% if not m %}<p class="muted">Замер начнётся с первого запроса службы после обновления.</p>

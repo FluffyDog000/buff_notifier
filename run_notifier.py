@@ -10,8 +10,7 @@ import signal
 import threading
 
 from notifier import config
-from notifier.poller import Poller
-from notifier.store import Store
+from notifier.pool import Pool
 
 log = logging.getLogger("buff")
 
@@ -22,16 +21,17 @@ def main() -> int:
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    poller = Poller(Store(config.STORE_PATH))
+    pool = Pool()
     log.info("Запущен. Настройки: %s", config.SETTINGS_PATH)
     while not stop.is_set():
         try:
-            wait = poller.cycle()
+            wait = pool.tick()
         except Exception:  # noqa: BLE001 - one bad cycle must not end the service
             log.exception("Сбой цикла")
             wait = 60.0
         stop.wait(wait)
     log.info("Остановлен.")
+    pool.close()
     return 0
 
 

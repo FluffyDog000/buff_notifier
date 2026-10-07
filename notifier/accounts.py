@@ -1,0 +1,187 @@
+"""Private account profiles. The original account remains in .env."""
+from __future__ import annotations
+
+import hashlib
+import ipaddress
+import json
+import math
+import os
+import tempfile
+import threading
+import uuid
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from . import config
+from .envfile import write_env
+
+ACCOUNT_PATH = config.DATA / "accounts.json"
+LOCK = threading.Lock()
+SESSION_KEYS = ("BUFF_COOKIE", "BUFF_CSRF", "BUFF_USER_AGENT", "BUFF_PROXY")
+
+
+def profile_key(account: dict) -> str:
+    return hashlib.sha256(json.dumps([account.get(k, "") for k in SESSION_KEYS]).encode()).hexdigest()
+
+
+def validate_proxy(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    try:
+        u = urlsplit(value)
+        if u.scheme not in ("http", "https", "socks5", "socks5h") or not u.hostname or not u.port:
+            raise ValueError
+    except ValueError:
+        raise ValueError("Прокси: http://логин:пароль@host:port или socks5://…") from None
+    return value
+
+
+def route_keys(profiles: list[dict]) -> dict[str, str]:
+    """Known equal exit IPs share a gate. Unverified proxy endpoints share by host/port."""
+    direct_ip = next((a.get("egress_ip") for a in profiles if not a["BUFF_PROXY"] and a.get("egress_ip")), None)
+    out = {}
+    for a in profiles:
+        proxy = a["BUFF_PROXY"]
+        if not proxy:
+            route = "ip:" + direct_ip if direct_ip else "direct"
+        elif a.get("egress_ip"):
+            route = "ip:" + a["egress_ip"]
+        else:
+            u = urlsplit(proxy)
+            route = "endpoint:" + hashlib.sha256(f"{u.hostname}:{u.port}".encode()).hexdigest()[:24]
+        out[a["id"]] = route
+    return out
+
+
+class Accounts:
+    def __init__(self, path: Path = ACCOUNT_PATH, env_path: Path = config.ENV_PATH):
+        self.path, self.env_path = Path(path), Path(env_path)
+
+    def _read(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, list) or len(data) > 200:
+                raise ValueError
+            ids = set()
+            for a in data:
+                if (not isinstance(a, dict) or not isinstance(a.get("id"), str)
+                        or a["id"] in ids or not isinstance(a.get("label"), str)
+                        or not isinstance(a.get("enabled"), bool)
+                        or (a.get("interval") is not None and
+                            (not isinstance(a["interval"], (int, float)) or not math.isfinite(a["interval"])
+                             or not 1 <= a["interval"] <= 600))
+                        or any(not isinstance(a.get(k, ""), str) for k in SESSION_KEYS)):
+                    raise ValueError
+                validate_proxy(a.get("BUFF_PROXY", ""))
+                if a.get("egress_ip"):
+                    ipaddress.ip_address(a["egress_ip"])
+                ids.add(a["id"])
+            return data
+        except (OSError, ValueError):
+            raise ValueError("Файл аккаунтов недоступен или повреждён; опрос остановлен.") from None
+
+    def _write(self, profiles: list[dict]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix="accounts-", suffix=".tmp", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(profiles, f, ensure_ascii=False, indent=1)
+            os.chmod(name, 0o600)
+            os.replace(name, self.path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
+    def list(self) -> list[dict]:
+        stored = self._read()
+        primary = {"id": "primary", "label": "Основной", "enabled": True, "interval": None}
+        primary.update(next((a for a in stored if a["id"] == "primary"), {}))
+        sec = config.load_secrets(self.env_path)
+        primary.update({k: sec[k] for k in SESSION_KEYS})
+        profiles = [primary] + [a.copy() for a in stored if a["id"] != "primary"]
+        for a in profiles:
+            for k in SESSION_KEYS:
+                a.setdefault(k, "")
+            if a.get("tested_key") != profile_key(a):
+                a.pop("egress_ip", None)
+        return profiles
+
+    def save(self, aid: str | None, label: str, session_values: dict | None = None,
+             proxy: str | None = None, interval: float | None = None) -> str:
+        label = label.strip()
+        if not 1 <= len(label) <= 80:
+            raise ValueError("Название аккаунта: от 1 до 80 символов.")
+        if interval is not None and (not math.isfinite(interval) or not 1 <= interval <= 600):
+            raise ValueError("Пауза: от 1 до 600 секунд.")
+        if proxy is not None:
+            proxy = validate_proxy(proxy)
+        with LOCK:
+            profiles = self._read()
+            if aid is None:
+                if sum(a["id"] != "primary" for a in profiles) >= 199:
+                    raise ValueError("Можно сохранить до 200 профилей.")
+                aid = uuid.uuid4().hex[:16]
+                a = {"id": aid, "enabled": False, **{k: "" for k in SESSION_KEYS}}
+                profiles.append(a)
+            else:
+                a = next((a for a in profiles if a["id"] == aid), None)
+                if a is None and aid == "primary":
+                    a = {"id": aid, "enabled": True}
+                    profiles.insert(0, a)
+                if a is None:
+                    raise ValueError("Аккаунт не найден.")
+            changes = {k: v for k, v in (session_values or {}).items() if k in SESSION_KEYS}
+            if proxy is not None:
+                changes["BUFF_PROXY"] = proxy
+            cookie = changes.get("BUFF_COOKIE")
+            if cookie and any(p["id"] != aid and p["BUFF_COOKIE"] == cookie for p in self.list()):
+                raise ValueError("Эта сессия уже используется другим профилем.")
+            a.update(label=label, interval=interval)
+            if changes:
+                a.pop("egress_ip", None)
+                a.pop("tested_key", None)
+                if aid != "primary":
+                    a["enabled"] = False
+                    a.update(changes)
+                else:
+                    write_env(self.env_path, changes)
+            self._write(profiles)
+            return aid
+
+    def tested(self, aid: str, expected_key: str, ip: str) -> None:
+        ip = str(ipaddress.ip_address(ip))
+        with LOCK:
+            live = next((a for a in self.list() if a["id"] == aid), None)
+            if not live or profile_key(live) != expected_key:
+                raise ValueError("Настройки аккаунта изменились; повторите проверку.")
+            profiles = self._read()
+            a = next((a for a in profiles if a["id"] == aid), None)
+            if a is None:
+                a = {"id": aid, "label": live["label"], "enabled": live["enabled"], "interval": live["interval"]}
+                profiles.insert(0, a)
+            a.update(egress_ip=ip, tested_key=expected_key)
+            self._write(profiles)
+
+    def toggle(self, aid: str) -> None:
+        with LOCK:
+            live = next((a for a in self.list() if a["id"] == aid), None)
+            if not live:
+                raise ValueError("Аккаунт не найден.")
+            if not live["enabled"] and (not live["BUFF_COOKIE"] or not live.get("egress_ip")):
+                raise ValueError("Сначала сохраните сессию и успешно проверьте аккаунт и IP.")
+            profiles = self._read()
+            a = next((a for a in profiles if a["id"] == aid), None)
+            if a is None:
+                a = {"id": aid, "label": live["label"], "interval": live["interval"]}
+                profiles.insert(0, a)
+            a["enabled"] = not live["enabled"]
+            self._write(profiles)
+
+    def remove(self, aid: str) -> None:
+        if aid == "primary":
+            raise ValueError("Основной аккаунт можно выключить, но нельзя удалить.")
+        with LOCK:
+            self._write([a for a in self._read() if a["id"] != aid])

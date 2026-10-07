@@ -208,3 +208,41 @@ def test_the_overview_shows_signals_and_state(app):
     store.set_status("session", "истекла")
     page = logged_in(app).get("/").get_data(as_text=True)
     assert NAME in page and "$18.00" in page and "истекла" in page and "1 предметов" in page
+
+
+def test_accounts_require_login_and_csrf_and_never_render_credentials(app):
+    from notifier.accounts import Accounts
+    assert app.test_client().get("/accounts").status_code == 302
+    c = logged_in(app)
+    assert c.post("/accounts/save", data={"label": "Two", "curl": CURL}).status_code == 400
+    token = csrf(c, "/accounts")
+    c.post("/accounts/save", data={"csrf": token, "label": "Two", "curl": CURL,
+                                  "proxy": "http://privateuser:privatepass@proxy.example:80", "interval": "5"})
+    registry = Accounts(app.tmp / "accounts.json", app.tmp / ".env")
+    a = registry.list()[1]
+    assert not a["enabled"]
+    c.post(f"/accounts/{a['id']}/toggle", data={"csrf": token})
+    assert not registry.list()[1]["enabled"]
+    r = c.post(f"/accounts/{a['id']}/test", data={"csrf": token}, follow_redirects=True)
+    assert "Сессия работает" in r.get_data(as_text=True)
+    c.post(f"/accounts/{a['id']}/toggle", data={"csrf": token})
+    assert registry.list()[1]["enabled"]
+    body = c.get("/accounts").get_data(as_text=True)
+    assert "SECRETVALUE123" not in body and "privatepass" not in body and "privateuser" not in body
+    assert "http://proxy.example:80" in body and "1.2.3.4" in body
+    c.post(f"/accounts/{a['id']}/remove", data={"csrf": token})
+    assert len(registry.list()) == 1
+
+
+def test_account_test_respects_existing_direct_ip_cooldown(app):
+    from datetime import datetime, timedelta, timezone
+    from notifier.accounts import Accounts
+    write_env(app.tmp / ".env", {"BUFF_COOKIE": "primary"})
+    registry = Accounts(app.tmp / "accounts.json", app.tmp / ".env")
+    aid = registry.save(None, "Two", {"BUFF_COOKIE": "other"}, "http://proxy.example:80", 5)
+    store = Store(app.tmp / "buff.db")
+    store.pause_route("direct", (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat())
+    c = logged_in(app)
+    body = c.post(f"/accounts/{aid}/test", data={"csrf": csrf(c, "/accounts")}, follow_redirects=True).get_data(as_text=True)
+    assert "IP занят или выдерживает паузу" in body and Client.calls == []
+    assert "egress_ip" not in registry.list()[1]

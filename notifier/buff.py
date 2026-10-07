@@ -5,14 +5,10 @@ There is no official API. The page asks
     GET https://api.buff.market/api/market/goods/sell_order
         ?game=csgo&page_num=1&page_size=10&goods_id=5777&sort_by=created.desc
 
-and that is all we ask too: one address, one request at a time, a pause
-between them. Without a login it answers `{"code": "Login Required"}`, so
-the one account's browser session goes along: its Cookie header, the CSRF
-token and the User-Agent it was made with. If the site starts to limit us,
-the answer is a shorter list or a slower pace, not more accounts.
-
-One proxy may stand in for the server's own address - one fixed address
-still, never a rotating pool: the point is a steady, ordinary visitor.
+Each client carries one account's browser Cookie, CSRF and User-Agent
+and uses a fixed proxy or the server address. Clients are coordinated by
+`pool.py`: separate exit IPs may work concurrently; equal IPs share pacing
+and cooldowns. A 429 honors Retry-After (15 minutes if absent).
 How the answer is read is `listings.py`.
 """
 from __future__ import annotations

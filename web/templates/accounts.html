@@ -1,0 +1,48 @@
+{% extends "base.html" %}{% block title %}Аккаунты{% endblock %}
+{% block body %}
+<h1>Аккаунты</h1>
+<div class="card">
+  <p>Аккаунты с отдельными адресами работают параллельно и разбирают общую очередь предметов. Один лот получает одно уведомление.</p>
+  <p class="muted">У каждого аккаунта своя сессия, пауза и статистика. Для одинакового исходящего IP действует общий темп и общая остановка после 429. Независимость лимитов разных аккаунтов и IP проверяется по фактическим результатам.</p>
+  <p class="muted">Новый аккаунт добавляется выключенным: сохраните curl и постоянный прокси → «Проверить сессию и IP» → «Включить». Основной аккаунт использует сессию из прежних настроек.</p>
+</div>
+{% for a in accounts %}
+<div class="card">
+  <h2>{{ a.label }} <span class="pill {{ 'ok' if a.enabled }}">{{ 'включён' if a.enabled else 'выключен' }}</span></h2>
+  <div class="grid">
+    <div>Сессия: {{ a.session_state }}<div class="muted">{{ 'сохранена' if a.has_cookie else 'не задана' }}</div></div>
+    <div>IP: {{ a.ip or 'не проверен' }}<div class="muted">{{ a.proxy or 'адрес сервера' }}</div></div>
+    <div>Пауза: {{ a.interval }} с{% if a.pause_until %}<div class="muted">Окончание последней паузы 429: {{ ago(a.pause_until) }}</div>{% endif %}</div>
+    {% if a.metrics %}<div>Запросы: {{ a.metrics.attempts }} · 429: {{ a.metrics.limited }}
+      <div class="muted">За последний час: {{ a.metrics.hour.polls }} опросов и {{ a.metrics.hour.searches }} поисков</div>
+      <div class="muted">{% if a.metrics.first_429_at %}Первое 429 через {{ a.metrics.first_429_minutes|round(1) }} мин, до него {{ a.metrics.before_429 }} запросов{% else %}В этом замере 429 ещё не было{% endif %}</div></div>{% endif %}
+  </div>
+  <div class="row">
+    <form method="post" action="{{ url_for('accounts_test', aid=a.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost">Проверить сессию и IP</button></form>
+    <form method="post" action="{{ url_for('accounts_toggle', aid=a.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost">{{ 'Выключить' if a.enabled else 'Включить' }}</button></form>
+    {% if a.id != 'primary' %}<form method="post" action="{{ url_for('accounts_remove', aid=a.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="danger">Удалить профиль</button></form>{% endif %}
+  </div>
+  <details class="row"><summary>Изменить название, сессию, прокси или паузу</summary>
+  <form method="post" action="{{ url_for('accounts_save') }}" style="width:100%">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ a.id }}">
+    <label>Название<input type="text" name="label" value="{{ a.label }}" required maxlength="80"></label>
+    <label>Новый curl<textarea name="curl" autocomplete="off" placeholder="Пусто — оставить текущую сессию"></textarea></label>
+    <label>Новый постоянный прокси<input type="password" name="proxy" autocomplete="new-password" placeholder="Пусто — оставить текущий"></label>
+    <label class="check"><input type="checkbox" name="clear_proxy">Убрать прокси и использовать адрес сервера</label>
+    <label>Пауза между запросами, с<input type="number" name="interval" min="1" max="600" step="any" value="{{ a.interval }}"></label>
+    <button>Сохранить</button>
+  </form></details>
+</div>
+{% endfor %}
+<div class="card">
+  <h2>Добавить аккаунт</h2>
+  <form method="post" action="{{ url_for('accounts_save') }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Название<input type="text" name="label" required maxlength="80" placeholder="Аккаунт 2"></label>
+    <label>Сессия — Copy as cURL (bash)<textarea name="curl" required autocomplete="off" placeholder="GET sell_order после входа этим аккаунтом на buff.market"></textarea></label>
+    <label>Постоянный прокси<input type="password" name="proxy" autocomplete="new-password" placeholder="http://логин:пароль@host:port или socks5://…"></label>
+    <label>Пауза между запросами, с<input type="number" name="interval" min="1" max="600" step="any" value="{{ default_interval }}"></label>
+    <button>Сохранить выключенным</button>
+  </form>
+</div>
+{% endblock %}

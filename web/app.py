@@ -13,10 +13,12 @@ back to the page - only their last characters.
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import logging
 import secrets as pysecrets
 import sqlite3
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -28,6 +30,7 @@ from werkzeug.security import check_password_hash
 
 from notifier import buff, candidates, config, sales
 from notifier.buff import BuffError, LoginRequired
+from notifier.accounts import Accounts, profile_key, route_keys, SESSION_KEYS
 from notifier.envfile import write_env
 from notifier.listings import item_url
 from notifier.poller import daily_load
@@ -45,7 +48,7 @@ TEST_GOODS_ID = 5777          # Desert Eagle | Mecha Industries (MW): any item w
 
 def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = config.SETTINGS_PATH,
                env_path: Path = config.ENV_PATH, client_factory=buff.from_config,
-               telegram_factory=Telegram, http_get=requests.get) -> Flask:
+               telegram_factory=Telegram, http_get=requests.get, accounts_path: Path | None = None) -> Flask:
     app = Flask(__name__)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
@@ -57,6 +60,7 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
                       SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
                       PERMANENT_SESSION_LIFETIME=timedelta(days=30))
     store = Store(store_path)
+    accounts = Accounts(accounts_path or Path(store_path).parent / "accounts.json", env_path)
     fails: dict[str, list[float]] = {}
 
     def settings() -> dict:
@@ -127,13 +131,151 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
         s, st = settings(), store.status()
         watch = store.watch_list()
         need, allowed = daily_load(watch, s)
+        try:
+            profiles = accounts.list()
+        except ValueError:
+            profiles = []
+        active_accounts = [a for a in profiles if a["enabled"] and a["BUFF_COOKIE"]]
+        route_map = route_keys(profiles)
+        capacities = {}
+        for a in active_accounts:
+            route = route_map[a["id"]]
+            capacities[route] = max(capacities.get(route, 0), a["interval"] or s["request_interval"])
+        throughput = sum(1 / interval for interval in capacities.values())
+        allowed = 86400 * throughput
         beat = st.get("heartbeat", {}).get("value")
         alive = bool(beat) and datetime.now(timezone.utc) - datetime.fromisoformat(beat) < timedelta(minutes=3)
         return render_template("index.html", st=st, alive=alive, beat=beat,
                                db=csfloat_info(s["csfloat_db"]), need=need, allowed=allowed,
                                active=sum(1 for w in watch if w["active"]),
-                               scan_min_minutes=sum(1 for w in watch if w["active"]) * s["request_interval"] / 60,
+                               account_count=len(active_accounts), route_count=len(capacities),
+                               total_hour=store.total_requests(), total_five=store.total_requests(minutes=5),
+                               scan_min_minutes=sum(1 for w in watch if w["active"]) / throughput / 60 if throughput else None,
                                signals=store.recent_signals(100), s=s, metrics=store.measurement_stats())
+
+    # -- parallel account profiles --------------------------------------------
+
+    @app.route("/accounts")
+    def accounts_page():
+        s = settings()
+        try:
+            profiles = accounts.list()
+        except ValueError as e:
+            flash(str(e), "error")
+            profiles = []
+        rows = []
+        routes = route_keys(profiles)
+        for a in profiles:
+            aid = a["id"]
+            metrics = store.measurement_stats(account_id=aid)["current"]
+            rows.append({"id": aid, "label": a["label"], "enabled": a["enabled"],
+                         "interval": a["interval"] or s["request_interval"],
+                         "proxy": buff.proxy_display(a["BUFF_PROXY"]), "has_cookie": bool(a["BUFF_COOKIE"]),
+                         "ip": a.get("egress_ip"), "session_state": store.get_status(f"account:{aid}:session") or "не проверялась",
+                         "pause_until": max(store.get_status(f"account:{aid}:pause_until") or "",
+                                            store.route_pause(routes[aid]) or "") or None, "metrics": metrics})
+        return render_template("accounts.html", accounts=rows, default_interval=s["request_interval"])
+
+    @app.route("/accounts/save", methods=["POST"])
+    def accounts_save():
+        try:
+            text = request.form.get("curl", "").strip()
+            values = parse_curl(text) if text else None
+            if text and not (values or {}).get("BUFF_COOKIE"):
+                raise ValueError("В curl нет сессии. Нужен GET sell_order из браузера после входа.")
+            if values:
+                values = {k: values.get(k, "") for k in ("BUFF_COOKIE", "BUFF_CSRF", "BUFF_USER_AGENT")}
+            raw = request.form.get("interval", "").strip()
+            interval = float(raw.replace(",", ".")) if raw else None
+            proxy = request.form.get("proxy", "").strip() or None
+            if request.form.get("clear_proxy"):
+                proxy = ""
+            aid = accounts.save(request.form.get("id") or None, request.form.get("label", ""), values, proxy, interval)
+            flash("Аккаунт сохранён. Новый или изменённый дополнительный аккаунт сначала проверьте, затем включите.", "ok")
+        except ValueError as e:
+            flash(str(e) if "could not convert" not in str(e) and "No closing quotation" not in str(e)
+                  else "Не разобрал ввод. Проверьте curl и числовую паузу.", "error")
+        return redirect(url_for("accounts_page"))
+
+    @app.route("/accounts/<aid>/toggle", methods=["POST"])
+    def accounts_toggle(aid):
+        try:
+            accounts.toggle(aid)
+        except ValueError as e:
+            flash(str(e), "error")
+        return redirect(url_for("accounts_page"))
+
+    @app.route("/accounts/<aid>/remove", methods=["POST"])
+    def accounts_remove(aid):
+        try:
+            accounts.remove(aid)
+        except ValueError as e:
+            flash(str(e), "error")
+        return redirect(url_for("accounts_page"))
+
+    @app.route("/accounts/<aid>/test", methods=["POST"])
+    def accounts_test(aid):
+        owner, route = "test:" + uuid.uuid4().hex, None
+        try:
+            profiles = accounts.list()
+            a = next((p for p in profiles if p["id"] == aid), None)
+            if not a or not a["BUFF_COOKIE"]:
+                raise ValueError("Сначала сохраните сессию аккаунта.")
+            key = profile_key(a)
+            s, sec = settings(), secrets()
+            s["request_interval"] = a["interval"] or s["request_interval"]
+            sec.update({k: a[k] for k in SESSION_KEYS})
+            # Learn the direct route too, so a proxy with the same exit IP cannot
+            # be mistaken for a separate source of capacity.
+            primary = profiles[0]
+            if a["BUFF_PROXY"] and not primary["BUFF_PROXY"] and not primary.get("egress_ip"):
+                direct_ip = str(ipaddress.ip_address(http_get("https://api.ipify.org?format=json", timeout=15, proxies={}).json()["ip"]))
+                accounts.tested("primary", profile_key(primary), direct_ip)
+                store.link_routes("direct", "ip:" + direct_ip)
+            proxy = a["BUFF_PROXY"]
+            ip = str(ipaddress.ip_address(http_get("https://api.ipify.org?format=json", timeout=15,
+                          proxies={"http": proxy, "https": proxy} if proxy else {}).json()["ip"]))
+            profiles = accounts.list()
+            a["egress_ip"] = ip
+            prospective = [a if p["id"] == aid else p for p in profiles]
+            route = route_keys(prospective)[aid]
+            store.link_routes(route_keys([{k: v for k, v in a.items() if k != "egress_ip"}])[aid], route)
+            now = datetime.now(timezone.utc)
+            own_pause = store.get_status(f"account:{aid}:pause_until")
+            if own_pause and datetime.fromisoformat(own_pause) > now:
+                raise ValueError("Аккаунт ещё выдерживает паузу после 429; дождитесь её окончания.")
+            interval = max([s["request_interval"]] + [p["interval"] or settings()["request_interval"] for p in prospective
+                           if p["enabled"] and route_keys(prospective)[p["id"]] == route])
+            if not store.acquire_route(route, owner, interval, now):
+                raise ValueError("Этот IP занят или выдерживает паузу; повторите проверку позже.")
+            gid = next((w["goods_id"] for w in store.watch_list()), TEST_GOODS_ID)
+            client = client_factory(s, sec)
+            try:
+                client.sell_orders(gid, page_size=1)
+            finally:
+                if hasattr(client, "session"):
+                    client.session.close()
+            accounts.tested(aid, key, ip)
+            store.set_status(f"account:{aid}:session", "работает")
+            store.set_status(f"account:{aid}:session_expired", None)
+            flash(f"Сессия работает. Исходящий IP: {ip}. Можно включить аккаунт.", "ok")
+        except LoginRequired:
+            store.set_status(f"account:{aid}:session", "истекла")
+            flash("Сессия истекла; сохраните свежий curl.", "error")
+        except BuffError as e:
+            if e.status == 429 and route:
+                until = (datetime.now(timezone.utc) + timedelta(seconds=e.retry_after if e.retry_after is not None else 900)).isoformat()
+                store.pause_route(route, until)
+                store.set_status(f"account:{aid}:pause_until", until)
+            flash(f"BuffMarket не принял проверку: HTTP {e.status or '—'}.", "error")
+        except requests.RequestException:
+            flash("Сеть или прокси не отвечают; аккаунт не проверен.", "error")
+        except (ValueError, KeyError) as e:
+            flash(str(e) if isinstance(e, ValueError) else "Не удалось определить IP.", "error")
+        finally:
+            if route:
+                store.release_route(route, owner)
+        return redirect(url_for("accounts_page"))
 
     # -- items ------------------------------------------------------------------
 
