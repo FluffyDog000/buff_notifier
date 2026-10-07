@@ -74,7 +74,7 @@ class Pool:
         # Preserve the single-account cooldown/session state when upgrading.
         for key in SCOPED:
             scoped = f"account:primary:{key}"
-            if self.store.get_status(scoped) is None:
+            if self.store.conn.execute("SELECT 1 FROM status WHERE key=?", (scoped,)).fetchone() is None:
                 value = self.store.get_status(key)
                 if value is not None:
                     self.store.set_status(scoped, value)

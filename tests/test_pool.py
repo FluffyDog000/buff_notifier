@@ -210,3 +210,14 @@ def test_legacy_primary_cooldown_survives_upgrade_and_constructor_failure_releas
         assert row["owner"] is None and row["busy_until"] is None
     finally:
         pool.close()
+
+
+def test_cleared_expired_marker_stays_cleared_on_restart(env):
+    store, settings, envp = env
+    store.set_status("session_expired", "stale-before-upgrade")
+    store.set_status("account:primary:session_expired", None)
+    pool = Pool(envp.parent / "buff.db", settings, envp)
+    try:
+        assert store.get_status("account:primary:session_expired") is None
+    finally:
+        pool.close()
