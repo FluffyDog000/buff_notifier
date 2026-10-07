@@ -1,0 +1,82 @@
+"""One request to BuffMarket's item page endpoint, and what came back.
+
+    python -m tools.probe 5777            # Desert Eagle | Mecha Industries (MW)
+    python -m tools.probe 5777 --size 3 --save probe.json
+
+Prints the status, the headers that matter for pacing, the shape of the
+answer and its first listings in full. A public listing holds nothing
+private; cookie values, should the site set any, are printed by name only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+import requests
+
+from notifier import config
+from notifier.buff import BuffClient, BuffError
+
+PACING = ("retry-after", "ratelimit", "x-ratelimit", "cf-", "server", "content-encoding",
+          "content-length", "content-type")
+
+
+def key_paths(obj, prefix: str = "", depth: int = 4) -> list[str]:
+    """Every key path down to `depth`, lists read through their first element."""
+    out = []
+    if depth < 0:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{prefix}.{k}" if prefix else str(k)
+            out.append(f"{p}: {type(v).__name__}")
+            out += key_paths(v, p, depth - 1)
+    elif isinstance(obj, list) and obj:
+        out += key_paths(obj[0], prefix + "[0]", depth - 1)
+    return out
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("goods_id", type=int)
+    ap.add_argument("--size", type=int, default=3, help="лотов на странице")
+    ap.add_argument("--save", help="сохранить ответ целиком в файл")
+    a = ap.parse_args(argv)
+
+    cfg = config.load()
+    client = BuffClient(cfg.buff_min_interval, cfg.buff_timeout)
+    try:
+        r = client.sell_orders(a.goods_id, page_size=a.size)
+    except BuffError as e:
+        print(f"Ошибка: {e}; retry_after={e.retry_after}")
+        return 1
+    except requests.RequestException as e:
+        print(f"Сеть: {e}")
+        return 1
+
+    print(f"HTTP {r.status_code}, {len(r.content)} байт после распаковки")
+    for k, v in r.headers.items():
+        if k.lower() == "set-cookie":
+            print(f"  {k}: {v.split('=', 1)[0]}=***")
+        elif any(k.lower().startswith(p) for p in PACING):
+            print(f"  {k}: {v}")
+    try:
+        body = r.json()
+    except ValueError:
+        print("Не JSON. Начало ответа:\n" + r.text[:1500])
+        return 1
+    if a.save:
+        with open(a.save, "w", encoding="utf-8") as fh:
+            json.dump(body, fh, ensure_ascii=False, indent=1)
+        print(f"Сохранено в {a.save}")
+
+    print("\nФорма ответа:")
+    print("\n".join("  " + p for p in key_paths(body)))
+    print("\nНачало ответа:")
+    print(json.dumps(body, ensure_ascii=False, indent=1)[:6000])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

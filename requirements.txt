@@ -1,0 +1,4 @@
+requests>=2.31
+brotli>=1.1           # urllib3 объявит br, ответ меньше
+python-dotenv>=1.0
+pytest>=8             # только для тестов
