@@ -33,8 +33,10 @@ cp .env.example .env && chmod 600 .env
   молча ломать уведомления. Связь с ботом — только схема базы.
 - `notifier/sales.py` — чтение `items` и `sales` на чтение, с `age_days`.
 - `notifier/buff.py` — запрос страницы предмета
-  `api.buff.market/api/market/goods/sell_order`, без кук и CSRF, по одному,
-  с паузой `BUFF_MIN_INTERVAL`.
+  `api.buff.market/api/market/goods/sell_order`, по одному, с паузой
+  `BUFF_MIN_INTERVAL`. Без входа сайт отвечает `Login Required`, поэтому
+  идёт сессия одного аккаунта из `.env`: `BUFF_COOKIE`, `BUFF_CSRF`,
+  `BUFF_USER_AGENT`.
 
 ## Пробник
 

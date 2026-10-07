@@ -4,8 +4,8 @@
     python -m tools.probe 5777 --size 3 --save probe.json
 
 Prints the status, the headers that matter for pacing, the shape of the
-answer and its first listings in full. A public listing holds nothing
-private; cookie values, should the site set any, are printed by name only.
+answer and its first listings in full. The session's cookie and token are
+never printed; cookies the site sets back are shown by name only.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import sys
 import requests
 
 from notifier import config
-from notifier.buff import BuffClient, BuffError
+from notifier.buff import BuffClient, BuffError, LoginRequired
 
 PACING = ("retry-after", "ratelimit", "x-ratelimit", "cf-", "server", "content-encoding",
           "content-length", "content-type")
@@ -45,15 +45,23 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     cfg = config.load()
-    client = BuffClient(cfg.buff_min_interval, cfg.buff_timeout)
+    if not cfg.buff_cookie:
+        print("BUFF_COOKIE в .env пуст - BuffMarket без входа ответит Login Required.")
+    client = BuffClient(cfg.buff_min_interval, cfg.buff_timeout, cfg.buff_cookie,
+                        cfg.buff_csrf, cfg.buff_user_agent)
+    # The raw answer is wanted here even when it is an error, so the request
+    # goes through the client's session but is read by hand.
     try:
-        r = client.sell_orders(a.goods_id, page_size=a.size)
+        client.sell_orders(a.goods_id, page_size=a.size)
+        print("Клиент: ответ принят.")
+    except LoginRequired as e:
+        print(f"Клиент: {e}")
     except BuffError as e:
-        print(f"Ошибка: {e}; retry_after={e.retry_after}")
-        return 1
+        print(f"Клиент: {e}; retry_after={e.retry_after}")
     except requests.RequestException as e:
         print(f"Сеть: {e}")
         return 1
+    r = client.last
 
     print(f"HTTP {r.status_code}, {len(r.content)} байт после распаковки")
     for k, v in r.headers.items():
