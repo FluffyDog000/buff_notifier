@@ -82,5 +82,32 @@ def test_the_message_says_what_the_brief_asks_for():
     text = message(x, NAME, judge(x, NAME, MARKET, S), "https://buff.market/x")
     for part in ("Дешевле рынка", NAME, "Float 0.16120", "паттерн 217", "Swallow",
                  "$80.00", "торг от $70.00", "$100.00", "$98.00", "$18.00",
-                 "медиана 8 продаж", "https://buff.market/x", "Лот L80.0-0.1612"):
+                 "сотая 0.16–0.17", "(8 продаж)", "(24 продаж)", "https://buff.market/x", "Лот L80.0-0.1612"):
         assert part in text, part
+
+
+def test_a_thin_hundredth_inflated_by_rare_sales_is_held_to_the_item_median():
+    """Five-SeveN | Heat Treated FT, 07.10: seven sales in 0.33-0.34 with a few
+    dear patterns among them put that hundredth at $5.30, while the item sells
+    at $2.59. A listing at $2.44 is no bargain."""
+    rows = [{"price": 2.59, "float_value": 0.205 + (i % 9) * 0.01, "age_days": 1.0 + i % 14}
+            for i in range(90)]
+    rows += [{"price": p, "float_value": 0.335, "age_days": 2.0 + i}
+             for i, p in enumerate((2.6, 3.0, 5.3, 5.3, 6.0, 9.0, 26.0))]
+    m = Market.build(rows, 14)
+    name = "AK-47 | Slate (Field-Tested)"
+    x = lot(2.44, 0.33442)
+    v = judge(x, name, m, dict(S, min_profit_usd=0.5))
+    assert v.kind is None and v.expected == 2.59
+    assert judge(x, name, m, dict(S, min_profit_usd=0.5, price_basis="item")).kind is None
+    assert judge(x, name, m, dict(S, min_profit_usd=0.5, price_basis="bucket")).kind == "cheap", \
+        "the old reading, kept as a choice"
+
+
+def test_a_worse_float_is_not_cheap_against_the_item_median():
+    v = judge(lot(85.0, 0.1712), NAME, MARKET, S)
+    assert v.expected == 98.0 and v.kind is None, "its own hundredth sells at 98, not 100"
+
+
+def test_heat_treated_is_a_pattern_skin():
+    assert is_pattern_skin("Five-SeveN | Heat Treated (Field-Tested)")

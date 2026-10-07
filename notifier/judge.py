@@ -18,7 +18,7 @@ Two signals:
    neighbour (no more than `normal_tolerance` above its median) and still
    leaves `min_profit_usd`.
 
-Pattern skins (Fade, Marble Fade, Case Hardened, Crimson Web) are priced by
+Pattern skins (Fade, Marble Fade, Case Hardened, Heat Treated, Crimson Web) are priced by
 the seed, not the float: skipped, or alerted with a warning.
 """
 from __future__ import annotations
@@ -28,13 +28,13 @@ import statistics
 from dataclasses import dataclass, field
 
 from . import phases
-from .estimate import BUCKET_MIN_SALES, estimate
+from .estimate import BUCKET_MIN_SALES, ITEM_MIN_SALES, estimate
 from .listings import Listing
 from .recency import choose_window, to_today, within
 
 # Read 45 days back: the longest window `choose_window` may settle on.
 HISTORY_DAYS = 45.0
-_PATTERN = re.compile(r"\| (Fade|Marble Fade|Case Hardened|Crimson Web) \(")
+_PATTERN = re.compile(r"\| (Fade|Marble Fade|Case Hardened|Heat Treated|Crimson Web) \(")
 
 
 def is_pattern_skin(name: str) -> bool:
@@ -63,6 +63,12 @@ class Market:
         for r in rows:
             m.buckets.setdefault(_bucket(float(r["float_value"])), []).append(float(r["price"]))
         return m
+
+    def item_median(self) -> tuple[float | None, int]:
+        """The whole item's median: what a typical float sells for."""
+        if len(self.rows) < ITEM_MIN_SALES:
+            return None, len(self.rows)
+        return statistics.median(float(r["price"]) for r in self.rows), len(self.rows)
 
     def bucket_median(self, lo: float) -> tuple[float | None, int]:
         prices = self.buckets.get(round(lo, 2), [])
@@ -101,28 +107,42 @@ def judge(listing: Listing, name: str, market: Market, s: dict) -> Verdict:
 
     cost = listing.price * s["usd_per_buff"] * (1 + s["buff_fee"])
     lo = _bucket(listing.float_value)
-    expected, basis = estimate(market.rows, listing.float_value)
-    in_bucket = market.bucket_median(lo)[1] >= BUCKET_MIN_SALES
-    if expected is None or (not in_bucket and not s["allow_item_median"]):
-        n = market.bucket_median(lo)[1]
-        return Verdict(None, f"мало продаж в сотой {lo:.2f} ({n})", cost=cost)
+    item_med, n_all = market.item_median()
+    b_med, n_b = market.bucket_median(lo)
+    band = f"{lo:.2f}–{lo + 0.01:.2f}"
+    mode = s.get("price_basis", "min")
+
+    if mode == "bucket":
+        expected, basis = estimate(market.rows, listing.float_value)
+        if b_med is None and not s["allow_item_median"]:
+            expected = None
+    elif mode == "item":
+        expected, basis = item_med, f"медиана {n_all} продаж предмета"
+    elif b_med is not None and item_med is not None:
+        expected = min(b_med, item_med)
+        basis = (f"меньшая из медиан: сотая {band} — ${b_med:.2f} ({n_b} продаж), "
+                 f"предмет — ${item_med:.2f} ({n_all} продаж)")
+    elif s["allow_item_median"]:
+        expected, basis = item_med, f"медиана {n_all} продаж предмета (в сотой {band} мало продаж)"
+    else:
+        expected, basis = None, ""
+    if expected is None:
+        return Verdict(None, f"мало продаж в сотой {band} ({n_b})", cost=cost)
     days = f" за {market.window:g} дн."
-    basis += days
     if market.shift is not None and abs(market.shift) >= 0.005:
-        basis += f", цены приведены к сегодняшним ({market.shift:+.0%} за окно)"
+        days += f", цены приведены к сегодняшним ({market.shift:+.0%} за окно)"
 
     net = expected * (1 - s["csfloat_fee"])
     profit = net - cost
     v = Verdict(None, cost=cost, expected=expected, net=net, profit=profit,
-                profit_pct=profit / cost if cost else None, basis=basis, pattern=pattern)
-    if profit < s["min_profit_usd"]:
-        v.reason = f"выгода ${profit:.2f}"
-        return v
-    if net > 0 and 1 - cost / net >= s["min_discount"]:
+                profit_pct=profit / cost if cost else None, basis=basis + days, pattern=pattern)
+    if profit >= s["min_profit_usd"] and net > 0 and 1 - cost / net >= s["min_discount"]:
         v.kind = "cheap"
         return v
 
-    if s["float_signal"] and in_bucket:
+    # A dear hundredth sold at an ordinary price: priced by the hundredth
+    # itself, against its cheaper neighbour - that gap is the whole signal.
+    if s["float_signal"] and b_med is not None:
         best = None
         for nlo in (round(lo - 0.01, 2), round(lo + 0.01, 2)):
             med, _ = market.bucket_median(nlo)
@@ -130,12 +150,16 @@ def judge(listing: Listing, name: str, market: Market, s: dict) -> Verdict:
                 best = (med, nlo)
         if best:
             normal, nlo = best
-            premium = expected / normal - 1
-            v.normal, v.normal_lo, v.premium = normal, nlo, premium
-            if premium >= s["min_float_premium"] and cost <= normal * (1 + s["normal_tolerance"]):
-                v.kind = "float"
-                return v
-    v.reason = f"скидка {1 - cost / net:.0%}" if net > 0 else "нет оценки"
+            premium = b_med / normal - 1
+            b_net = b_med * (1 - s["csfloat_fee"])
+            if (premium >= s["min_float_premium"] and cost <= normal * (1 + s["normal_tolerance"])
+                    and b_net - cost >= s["min_profit_usd"]):
+                return Verdict("float", cost=cost, expected=b_med, net=b_net, profit=b_net - cost,
+                               profit_pct=(b_net - cost) / cost, pattern=pattern,
+                               basis=f"медиана {n_b} продаж в {band}" + days,
+                               normal=normal, normal_lo=nlo, premium=premium)
+    v.reason = (f"выгода ${profit:.2f}" if profit < s["min_profit_usd"]
+                else f"скидка {1 - cost / net:.0%}" if net > 0 else "нет оценки")
     return v
 
 
