@@ -17,6 +17,7 @@ import requests
 
 from notifier import config
 from notifier.buff import BuffClient, BuffError, LoginRequired
+from notifier.listings import parse_page
 
 PACING = ("retry-after", "ratelimit", "x-ratelimit", "cf-", "server", "content-encoding",
           "content-length", "content-type")
@@ -81,8 +82,15 @@ def main(argv=None) -> int:
 
     print("\nФорма ответа:")
     print("\n".join("  " + p for p in key_paths(body)))
+    if body.get("code") == "OK":
+        page = parse_page(body)
+        print(f"\nЛотов всего: {page.total}, на странице разобрано: {len(page.listings)}")
+        for x in page.listings:
+            when = x.created_at.strftime("%d.%m %H:%M UTC") if x.created_at else "?"
+            print(f"  {x.id}  ${x.price:.2f}  float {x.float_value}  seed {x.paint_seed}  "
+                  f"выставлен {when}" + (f"  наклейки: {', '.join(x.stickers)}" if x.stickers else ""))
     print("\nНачало ответа:")
-    print(json.dumps(body, ensure_ascii=False, indent=1)[:6000])
+    print(json.dumps(body, ensure_ascii=False, indent=1)[:1200])
     return 0
 
 
