@@ -1,0 +1,178 @@
+"""The notifier's own database (`data/buff.db`), shared with the web page.
+
+    watch    - which BuffMarket items are polled: goods_id, the CSFloat name
+               it is priced by, when it is next due, how the last poll went
+    seen     - listing ids already read, to tell new ones from old (30 days)
+    signals  - every alert ever made, one per listing - the "never twice"
+    status   - small facts for the page: last cycle, session state, pause
+"""
+from __future__ import annotations
+
+import sqlite3
+import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS watch (
+    goods_id      INTEGER PRIMARY KEY,
+    name          TEXT    NOT NULL,          -- CSFloat market_hash_name (phase name allowed)
+    active        INTEGER NOT NULL DEFAULT 1,
+    added_at      TEXT    NOT NULL,
+    next_poll_at  TEXT,
+    last_poll_at  TEXT,
+    last_ok_at    TEXT,
+    last_error    TEXT,
+    interval_min  REAL,
+    sales_per_day REAL,
+    polls         INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS seen (
+    listing_id    TEXT PRIMARY KEY,
+    goods_id      INTEGER NOT NULL,
+    first_seen    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_seen_time ON seen(first_seen);
+CREATE TABLE IF NOT EXISTS signals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    listing_id    TEXT UNIQUE NOT NULL,
+    goods_id      INTEGER NOT NULL,
+    name          TEXT NOT NULL,
+    kind          TEXT NOT NULL,             -- cheap | float
+    price_usd     REAL,
+    float_value   REAL,
+    paint_seed    INTEGER,
+    expected      REAL,                      -- CSFloat median the listing is priced by
+    profit        REAL,                      -- after both fees, USD
+    profit_pct    REAL,
+    basis         TEXT,
+    text          TEXT,
+    created_at    TEXT NOT NULL,
+    sent          INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS status (
+    key           TEXT PRIMARY KEY,
+    value         TEXT,
+    at            TEXT
+);
+"""
+
+
+def now_iso(now: datetime | None = None) -> str:
+    return (now or datetime.now(timezone.utc)).replace(microsecond=0).isoformat()
+
+
+class Store:
+    def __init__(self, path: Path | str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(path), timeout=30, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.executescript(SCHEMA)
+        self.lock = threading.Lock()
+
+    # -- watch list ---------------------------------------------------------
+
+    def add_watch(self, goods_id: int, name: str) -> None:
+        with self.lock, self.conn:
+            self.conn.execute(
+                "INSERT INTO watch(goods_id, name, added_at) VALUES (?,?,?) "
+                "ON CONFLICT(goods_id) DO UPDATE SET name = excluded.name, active = 1",
+                (goods_id, name.strip(), now_iso()))
+
+    def remove_watch(self, goods_id: int) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM watch WHERE goods_id = ?", (goods_id,))
+
+    def set_active(self, goods_id: int, active: bool) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("UPDATE watch SET active = ? WHERE goods_id = ?",
+                              (1 if active else 0, goods_id))
+
+    def watch_list(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM watch ORDER BY name")]
+
+    def next_due(self, now: datetime) -> dict | None:
+        """The active item most overdue, or None when nothing is due yet."""
+        row = self.conn.execute(
+            "SELECT * FROM watch WHERE active = 1 AND (next_poll_at IS NULL OR next_poll_at <= ?) "
+            "ORDER BY next_poll_at IS NOT NULL, next_poll_at LIMIT 1", (now_iso(now),)).fetchone()
+        return dict(row) if row else None
+
+    def soonest(self) -> datetime | None:
+        row = self.conn.execute(
+            "SELECT MIN(next_poll_at) FROM watch WHERE active = 1").fetchone()
+        return datetime.fromisoformat(row[0]) if row and row[0] else None
+
+    def polled(self, goods_id: int, now: datetime, interval_min: float,
+               sales_per_day: float | None, error: str | None = None) -> None:
+        with self.lock, self.conn:
+            self.conn.execute(
+                "UPDATE watch SET last_poll_at = ?, next_poll_at = ?, interval_min = ?, "
+                "sales_per_day = COALESCE(?, sales_per_day), last_error = ?, "
+                "last_ok_at = CASE WHEN ? IS NULL THEN ? ELSE last_ok_at END, "
+                "polls = polls + CASE WHEN ? IS NULL THEN 1 ELSE 0 END WHERE goods_id = ?",
+                (now_iso(now), now_iso(now + timedelta(minutes=interval_min)), interval_min,
+                 sales_per_day, error, error, now_iso(now), error, goods_id))
+
+    # -- listings -------------------------------------------------------------
+
+    def unseen(self, listing_ids: list[str]) -> set[str]:
+        if not listing_ids:
+            return set()
+        marks = ",".join("?" * len(listing_ids))
+        known = {r[0] for r in self.conn.execute(
+            f"SELECT listing_id FROM seen WHERE listing_id IN ({marks})", listing_ids)}
+        return set(listing_ids) - known
+
+    def mark_seen(self, goods_id: int, listing_ids, now: datetime) -> None:
+        with self.lock, self.conn:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO seen(listing_id, goods_id, first_seen) VALUES (?,?,?)",
+                [(i, goods_id, now_iso(now)) for i in listing_ids])
+
+    def prune_seen(self, now: datetime, days: int = 30) -> int:
+        with self.lock, self.conn:
+            return self.conn.execute("DELETE FROM seen WHERE first_seen < ?",
+                                     (now_iso(now - timedelta(days=days)),)).rowcount
+
+    # -- signals --------------------------------------------------------------
+
+    def signalled(self, listing_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM signals WHERE listing_id = ?",
+                                 (listing_id,)).fetchone() is not None
+
+    def add_signal(self, sig: dict) -> int | None:
+        """Row id, or None when this listing already had its one alert."""
+        cols = ("listing_id", "goods_id", "name", "kind", "price_usd", "float_value",
+                "paint_seed", "expected", "profit", "profit_pct", "basis", "text", "created_at")
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                f"INSERT OR IGNORE INTO signals({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                [sig.get(c) for c in cols])
+            return cur.lastrowid if cur.rowcount else None
+
+    def mark_sent(self, signal_id: int) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("UPDATE signals SET sent = 1 WHERE id = ?", (signal_id,))
+
+    def recent_signals(self, limit: int = 50) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))]
+
+    # -- status ---------------------------------------------------------------
+
+    def set_status(self, key: str, value: str | None) -> None:
+        with self.lock, self.conn:
+            self.conn.execute(
+                "INSERT INTO status(key, value, at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = excluded.at",
+                (key, value, now_iso()))
+
+    def status(self) -> dict[str, dict]:
+        return {r["key"]: {"value": r["value"], "at": r["at"]}
+                for r in self.conn.execute("SELECT * FROM status")}
+
+    def get_status(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM status WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None

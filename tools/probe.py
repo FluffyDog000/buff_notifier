@@ -16,7 +16,7 @@ import sys
 import requests
 
 from notifier import config
-from notifier.buff import BuffClient, BuffError, LoginRequired
+from notifier.buff import BuffError, LoginRequired, from_config
 from notifier.listings import parse_page
 
 PACING = ("retry-after", "ratelimit", "x-ratelimit", "cf-", "server", "content-encoding",
@@ -45,11 +45,10 @@ def main(argv=None) -> int:
     ap.add_argument("--save", help="сохранить ответ целиком в файл")
     a = ap.parse_args(argv)
 
-    cfg = config.load()
-    if not cfg.buff_cookie:
+    sec = config.load_secrets()
+    if not sec["BUFF_COOKIE"]:
         print("BUFF_COOKIE в .env пуст - BuffMarket без входа ответит Login Required.")
-    client = BuffClient(cfg.buff_min_interval, cfg.buff_timeout, cfg.buff_cookie,
-                        cfg.buff_csrf, cfg.buff_user_agent)
+    client = from_config(config.load_settings(), sec)
     # The raw answer is wanted here even when it is an error, so the request
     # goes through the client's session but is read by hand.
     try:

@@ -9,18 +9,23 @@ file at mode 600. Values are never printed - only cookie names and lengths.
 """
 from __future__ import annotations
 
-import os
+import re
 import shlex
 import sys
 from pathlib import Path
 
-from notifier.config import ROOT
+from notifier.config import ENV_PATH
+from notifier.envfile import write_env
 
 KEYS = ("BUFF_COOKIE", "BUFF_CSRF", "BUFF_USER_AGENT")
 
 
 def parse_curl(text: str) -> dict[str, str]:
-    """BUFF_* values found in a bash-style curl command."""
+    """BUFF_* values found in a curl command, bash or Windows cmd style."""
+    if '^"' in text:
+        # cmd: ^ escapes every special character and ends every line.
+        text = re.sub(r"\^\r?\n", " ", text)
+        text = re.sub(r"\^(.)", r"\1", text)
     text = text.replace("\\\r\n", " ").replace("\\\n", " ")
     words = shlex.split(text)
     headers: dict[str, str] = {}
@@ -43,19 +48,6 @@ def parse_curl(text: str) -> dict[str, str]:
     return out
 
 
-def write_env(path: Path, values: dict[str, str]) -> None:
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    lines = [ln for ln in lines if ln.split("=", 1)[0].strip() not in values]
-    for k, v in values.items():
-        if "'" in v:
-            raise ValueError(f"{k}: одинарная кавычка в значении, впишите вручную")
-        lines.append(f"{k}='{v}'")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
-    os.chmod(path, 0o600)
-
-
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv:
@@ -76,8 +68,8 @@ def main(argv=None) -> int:
     print(f"Куки: {', '.join(names)}")
     for k in ("BUFF_CSRF", "BUFF_USER_AGENT"):
         print(f"{k}: {'есть, ' + str(len(values[k])) + ' символов' if k in values else 'нет'}")
-    write_env(ROOT / ".env", values)
-    print(f"Записано в {ROOT / '.env'} (права 600).")
+    write_env(ENV_PATH, values)
+    print(f"Записано в {ENV_PATH} (права 600).")
     return 0
 
 
