@@ -1,0 +1,47 @@
+{% extends "base.html" %}{% block title %}Предметы{% endblock %}
+{% block body %}
+<h1>Предметы</h1>
+<div class="card">
+  <h2>Добавить</h2>
+  <form method="post" action="{{ url_for('items_add') }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label for="lines">По строке: <code>goods_id</code> или <code>goods_id;название как в CSFloat-боте</code></label>
+    <textarea id="lines" name="lines" placeholder="5777&#10;24322;M4A4 | Temukau (Field-Tested)"></textarea>
+    <div class="help">goods_id виден в запросе <code>sell_order</code> на странице предмета (DevTools → Network).
+      Без названия оно берётся с BuffMarket (до 10 за раз). Предмет должен быть в базе CSFloat-бота:
+      по его продажам считается рынок. Для фаз Doppler впишите название с фазой.</div>
+    <div class="row"><button>Добавить</button></div>
+  </form>
+  {% if names %}
+  <details><summary>Предметы CSFloat-бота ({{ names|length }})</summary>
+    <pre>{% for n in names %}{{ n }}
+{% endfor %}</pre></details>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Опрашиваются</h2>
+  {% if not watch %}<p class="muted">Список пуст.</p>{% else %}
+  <div class="scroll"><table class="cards">
+    <tr><th>Предмет</th><th>goods_id</th><th>Продаж в сутки</th><th>Интервал</th><th>Опрос</th><th></th></tr>
+    {% for w in watch %}
+    <tr>
+      <td class="title">{% if not w.active %}<span class="pill">выкл</span> {% endif %}<a href="{{ url(w.name) }}" target="_blank" rel="noopener">{{ w.name }}</a>
+        {% if w.last_error %}<div class="err muted">{{ w.last_error }}</div>{% endif %}</td>
+      <td data-label="goods_id">{{ w.goods_id }}</td>
+      <td data-label="Продаж в сутки">{{ '%.1f'|format(w.sales_per_day) if w.sales_per_day is not none else '—' }}</td>
+      <td data-label="Интервал">{{ (w.interval_min|round|int ~ ' мин') if w.interval_min else '—' }}</td>
+      <td class="muted" data-label="Опрос">был {{ ago(w.last_poll_at) }}, след. {{ ago(w.next_poll_at) if w.next_poll_at else 'сейчас' }}</td>
+      <td class="actions">
+        <form method="post" action="{{ url_for('items_toggle', gid=w.goods_id) }}" class="inline">
+          <input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost small">{{ 'выкл' if w.active else 'вкл' }}</button></form>
+        <form method="post" action="{{ url_for('items_delete', gid=w.goods_id) }}" class="inline"
+              onsubmit='return confirm({{ ("Убрать " ~ w.name ~ "?")|tojson }})'>
+          <input type="hidden" name="csrf" value="{{ csrf }}"><button class="danger small">×</button></form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table></div>
+  {% endif %}
+</div>
+{% endblock %}

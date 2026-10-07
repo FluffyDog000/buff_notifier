@@ -1,0 +1,49 @@
+{% extends "base.html" %}{% block title %}Обзор{% endblock %}
+{% block body %}
+<h1>Обзор</h1>
+<div class="card grid">
+  <div class="kv"><div class="k">Сервис</div>
+    <div class="v {{ 'ok' if alive else 'err' }}">{{ 'работает' if alive else 'не отвечает' }}</div>
+    <div class="muted">последний цикл {{ ago(beat) }}{% if not alive %} — <code>systemctl status buff-notifier</code>{% endif %}</div></div>
+  <div class="kv"><div class="k">Состояние</div>
+    <div class="v">{{ st.state.value if st.state else '—' }}</div></div>
+  <div class="kv"><div class="k">Сессия BuffMarket</div>
+    {% set ss = st.session.value if st.session else 'не проверялась' %}
+    <div class="v {{ 'ok' if ss == 'работает' else 'err' if ss in ('истекла', 'нет') else 'warn' }}">{{ ss }}</div>
+    {% if ss != 'работает' %}<div class="muted"><a href="{{ url_for('settings_page') }}#session">обновить</a></div>{% endif %}</div>
+  <div class="kv"><div class="k">База CSFloat</div>
+    {% if db.ok %}<div class="v ok">{{ db.count }} предметов</div>
+      <div class="muted">последняя продажа {{ ago(db.last_sale) }}</div>
+    {% else %}<div class="v err">{{ db.error }}</div><div class="muted">{{ db.path }}</div>{% endif %}</div>
+  <div class="kv"><div class="k">Нагрузка</div>
+    <div class="v {{ 'err' if need > allowed else '' }}">{{ need|round|int }} запросов в сутки</div>
+    <div class="muted">{{ active }} предметов; при паузе {{ s.request_interval|round(1) }} с успеваем {{ allowed|round|int }}</div></div>
+  {% if st.pause_until and st.pause_until.value and st.pause_until.value > (st.heartbeat.value if st.heartbeat else '') %}
+  <div class="kv"><div class="k">Пауза после 429</div><div class="v warn">до {{ st.pause_until.value[11:16] }} UTC</div></div>
+  {% endif %}
+  {% if st.last_gap %}
+  <div class="kv"><div class="k">Последний возможный пропуск</div>
+    <div class="v warn" style="font-weight:500">{{ st.last_gap.value }}</div><div class="muted">{{ ago(st.last_gap.at) }}</div></div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Сигналы</h2>
+  {% if not signals %}<p class="muted">Пока ни одного.</p>{% else %}
+  <div class="scroll"><table class="cards">
+    <tr><th>Когда</th><th>Предмет</th><th>Float</th><th>Цена</th><th>CSFloat</th><th>Выгода</th><th></th></tr>
+    {% for g in signals %}
+    <tr>
+      <td data-label="Когда" class="muted">{{ ago(g.created_at) }}</td>
+      <td class="title">{{ '🟢' if g.kind == 'cheap' else '💎' }} {{ g.name }}{% if not g.sent %} <span class="pill err">не отправлено</span>{% endif %}</td>
+      <td data-label="Float">{{ '%.5f'|format(g.float_value) if g.float_value is not none }}</td>
+      <td data-label="Цена">${{ '%.2f'|format(g.price_usd) }}</td>
+      <td data-label="CSFloat">${{ '%.2f'|format(g.expected) }}</td>
+      <td data-label="Выгода"><span><span class="ok">${{ '%.2f'|format(g.profit) }}</span> <span class="muted">{{ (g.profit_pct * 100)|round|int }}%</span></span></td>
+      <td><details><summary>текст</summary><pre>{{ g.text }}</pre></details></td>
+    </tr>
+    {% endfor %}
+  </table></div>
+  {% endif %}
+</div>
+{% endblock %}

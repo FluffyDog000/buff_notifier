@@ -1,0 +1,14 @@
+[Unit]
+Description=BuffMarket notifier web panel (127.0.0.1:5050, outside via Caddy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/buff_notifier
+ExecStart=/root/buff_notifier/.venv/bin/python run_web.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

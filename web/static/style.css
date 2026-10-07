@@ -1,0 +1,70 @@
+:root {
+  --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+  --accent: #b8862d; --ok: #1f8a4c; --ok-bg: #e7f6ed; --err: #b42318; --err-bg: #fdecea;
+  --warn: #9a6700; --warn-bg: #fff6dc;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161b; --card: #1d2027; --text: #e7e9ee; --muted: #9aa1b0; --line: #2c313b;
+    --accent: #d6a94e; --ok: #4cc27f; --ok-bg: #16301f; --err: #ff7a6b; --err-bg: #3a1d1a;
+    --warn: #e6b84a; --warn-bg: #332a12;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+header { background: var(--card); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+.bar { max-width: 1100px; margin: 0 auto; padding: 10px 16px; display: flex; gap: 14px;
+       align-items: center; flex-wrap: wrap; }
+.brand { font-weight: 700; color: var(--accent); margin-right: auto; }
+nav a { color: var(--text); text-decoration: none; padding: 6px 2px; }
+nav a.on { border-bottom: 2px solid var(--accent); }
+main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 20px; margin: 4px 0 14px; }
+h2 { font-size: 16px; margin: 0 0 10px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+        margin-bottom: 14px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 18px; }
+.kv .k { color: var(--muted); font-size: 13px; }
+.kv .v { font-weight: 600; word-break: break-word; }
+.muted { color: var(--muted); font-size: 13px; }
+.ok { color: var(--ok); } .err { color: var(--err); } .warn { color: var(--warn); }
+.flash { padding: 10px 12px; border-radius: 8px; margin-bottom: 10px; }
+.flash.ok { background: var(--ok-bg); color: var(--ok); }
+.flash.error { background: var(--err-bg); color: var(--err); }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 13px; }
+.scroll { overflow-x: auto; }
+input[type=text], input[type=password], input[type=number], select, textarea {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg); color: var(--text); font: inherit; }
+textarea { min-height: 110px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+label { display: block; margin: 10px 0 4px; font-weight: 500; }
+label.check { display: flex; gap: 8px; align-items: center; font-weight: 500; }
+.help { color: var(--muted); font-size: 12px; margin-top: 3px; }
+.fielderr { color: var(--err); font-size: 12px; }
+button, .btn { display: inline-block; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--accent);
+  background: var(--accent); color: #fff; font: inherit; cursor: pointer; text-decoration: none; }
+button.ghost { background: transparent; color: var(--accent); }
+button.small { padding: 3px 9px; font-size: 13px; }
+button.danger { border-color: var(--err); background: transparent; color: var(--err); }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+form.inline { display: inline; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; background: var(--bg);
+        border: 1px solid var(--line); }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+pre { white-space: pre-wrap; font-size: 13px; margin: 6px 0 0; }
+.login { max-width: 340px; margin: 12vh auto; }
+
+td.actions { white-space: nowrap; }
+@media (max-width: 640px) {
+  table.cards, table.cards tbody, table.cards tr, table.cards td { display: block; width: 100%; }
+  table.cards tr:first-child { display: none; }
+  table.cards tr { border-bottom: 1px solid var(--line); padding: 8px 0; }
+  table.cards td { border: 0; padding: 2px 0; }
+  table.cards td.title { font-weight: 600; padding-bottom: 4px; }
+  table.cards td[data-label] { display: flex; justify-content: space-between; gap: 12px; }
+  table.cards td[data-label]::before { content: attr(data-label); color: var(--muted); font-size: 13px; }
+  table.cards td.actions { padding-top: 6px; }
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=BuffMarket notifier (polls listings, alerts in Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/buff_notifier
+ExecStart=/root/buff_notifier/.venv/bin/python run_notifier.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

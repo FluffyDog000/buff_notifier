@@ -1,0 +1,10 @@
+{% extends "base.html" %}{% block title %}Нужен пароль{% endblock %}
+{% block body %}
+<div class="card login">
+  <h1>Задайте пароль</h1>
+  <p>Панель открыта в интернет, поэтому без пароля не работает. На сервере:</p>
+  <pre>cd /root/buff_notifier
+.venv/bin/python -m tools.set_password</pre>
+  <p>Потом обновите эту страницу.</p>
+</div>
+{% endblock %}
