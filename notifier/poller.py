@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -67,10 +68,15 @@ class Poller:
         return self._client
 
     def csfloat(self, path: str) -> sqlite3.Connection:
-        if self._db is None or path != self._db_path:
-            if not Path(path).exists():
-                raise FileNotFoundError(path)
-            self._db, self._db_path = self.connect(path), path
+        """The bot's database, reopened when the path or the file itself changes:
+        a fresh snapshot replaces the file, and an open connection would go on
+        reading the old one."""
+        st = os.stat(path)          # FileNotFoundError when it is not there
+        ident = (path, st.st_ino, st.st_dev)
+        if self._db is None or ident != self._db_path:
+            if self._db is not None:
+                self._db.close()
+            self._db, self._db_path = self.connect(path), ident
         return self._db
 
     def alert_once(self, tg: Telegram, key: str, marker: str, text: str) -> None:

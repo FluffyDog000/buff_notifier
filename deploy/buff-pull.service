@@ -1,0 +1,10 @@
+[Unit]
+Description=BuffMarket notifier: snapshot of the CSFloat bot's database from its server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/buff_notifier
+ExecStart=/root/buff_notifier/.venv/bin/python -m tools.pull_csfloat
+TimeoutStartSec=900

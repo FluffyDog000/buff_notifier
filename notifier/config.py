@@ -87,7 +87,12 @@ FIELDS: tuple[Field, ...] = (
           "Сколько новейших лотов брать за один запрос.", 1, 50, group="Опрос"),
     Field("paused", "bool", False, "Пауза: не опрашивать BuffMarket", group="Опрос"),
     Field("csfloat_db", "str", "/root/csfloatpricesparcing/data/csfloat_sales.db",
-          "База CSFloat-бота", "Открывается только на чтение.", group="Опрос"),
+          "База CSFloat-бота", "Открывается только на чтение. Если бот на другом сервере — "
+          "сюда сама встанет копия data/csfloat_snapshot.db.", group="Опрос"),
+    Field("csfloat_remote", "str", "", "Сервер CSFloat-бота для копии базы",
+          "Если бот работает на другом сервере: root@его-IP. Раз в час оттуда приходит "
+          "копия базы (docs/DEPLOY.md, раздел «База с другого сервера»). Пусто — база здесь.",
+          group="Опрос"),
 )
 FIELD = {f.key: f for f in FIELDS}
 

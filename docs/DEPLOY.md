@@ -164,6 +164,96 @@ ufw allow 443/tcp
 Всё, что меняется в панели, служба опроса подхватывает сама, перезапуск не
 нужен.
 
+## База с другого сервера
+
+Если CSFloat-бот работает на **другом** сервере, база приходит оттуда копией
+раз в час: предметы и продажи за 60 дней, несколько мегабайт. Ключ SSH для
+этого умеет только одно — выдать копию: зайти по нему на сервер бота нельзя.
+
+Ниже **«сервер бота»** — где работает CSFloat-бот, **«этот сервер»** — где
+buff_notifier.
+
+**1. На сервере бота — найти базу:**
+
+```bash
+find / -name "csfloat_sales*.db" -not -path "/proc/*" -not -path "/tmp/*" 2>/dev/null
+```
+
+Запомните путь (дальше — `ПУТЬ_К_БАЗЕ`).
+
+**2. На сервере бота — положить скрипт копии.** Он только читает базу.
+
+```bash
+cd /root
+```
+```bash
+git clone https://github.com/fluffydog000/buff_notifier.git buff_export
+```
+```bash
+cd /root/buff_export && git checkout claude/new-session-gco59s
+```
+
+Проверка — должно напечататься число больше нуля:
+
+```bash
+python3 /root/buff_export/tools/csfloat_export.py ПУТЬ_К_БАЗЕ | wc -c
+```
+
+**3. На этом сервере — сделать ключ и показать его:**
+
+```bash
+ssh-keygen -t ed25519 -N "" -f /root/.ssh/csfloat_pull
+```
+```bash
+cat /root/.ssh/csfloat_pull.pub
+```
+
+Скопируйте напечатанную строку целиком (начинается с `ssh-ed25519`). Это
+открытая часть ключа, её не страшно показывать.
+
+**4. На сервере бота — разрешить этому ключу только копию.** В команде
+замените `ПУТЬ_К_БАЗЕ` и `СТРОКА_КЛЮЧА` (одинарные кавычки оставить):
+
+```bash
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+```
+```bash
+echo 'command="python3 /root/buff_export/tools/csfloat_export.py ПУТЬ_К_БАЗЕ",restrict СТРОКА_КЛЮЧА' >> /root/.ssh/authorized_keys
+```
+
+**5. На этом сервере — указать сервер бота и проверить.** В панели:
+**Настройки → Опрос → Сервер CSFloat-бота** — `root@IP-сервера-бота`,
+«Сохранить настройки». Затем:
+
+```bash
+cd /root/buff_notifier && git pull
+```
+```bash
+.venv/bin/python -m tools.pull_csfloat
+```
+
+Должно быть `Готово: N предметов, M продаж…`. Путь к базе в настройках
+встанет сам (`data/csfloat_snapshot.db`).
+
+**6. На этом сервере — копия каждый час:**
+
+```bash
+cp deploy/buff-pull.service deploy/buff-pull.timer /etc/systemd/system/
+```
+```bash
+systemctl daemon-reload
+```
+```bash
+systemctl enable --now buff-pull.timer
+```
+
+На «Обзоре» под «База CSFloat» видно, когда пришла последняя копия.
+
+Если на шаге 5 `Permission denied` — на сервере бота вход под root по ключу
+запрещён (`PermitRootLogin no`). Тогда шаги 2 и 4 делаются под тем
+пользователем, от которого работает бот (`/home/ИМЯ/...` вместо `/root/...`),
+а в панели — `ИМЯ@IP-сервера-бота`.
+
 ## Если не открывается
 
 ```bash

@@ -14,7 +14,8 @@
   <div class="kv"><div class="k">База CSFloat</div>
     {% if db.ok %}<div class="v ok">{{ db.count }} предметов</div>
       <div class="muted">последняя продажа {{ ago(db.last_sale) }}</div>
-    {% else %}<div class="v err">{{ db.error }}</div><div class="muted">{{ db.path }}</div>{% endif %}</div>
+    {% else %}<div class="v err">{{ db.error }}</div><div class="muted">{{ db.path }}</div>{% endif %}
+    {% if st.csfloat_pull %}<div class="muted {{ 'err' if st.csfloat_pull.value.startswith('ошибка') }}">копия с сервера бота {{ ago(st.csfloat_pull.at) }}: {{ st.csfloat_pull.value }}</div>{% endif %}</div>
   <div class="kv"><div class="k">Нагрузка</div>
     <div class="v {{ 'err' if need > allowed else '' }}">{{ need|round|int }} запросов в сутки</div>
     <div class="muted">{{ active }} предметов; при паузе {{ s.request_interval|round(1) }} с успеваем {{ allowed|round|int }}</div></div>

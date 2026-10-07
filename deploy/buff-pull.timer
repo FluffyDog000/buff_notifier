@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly snapshot of the CSFloat bot's database
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
