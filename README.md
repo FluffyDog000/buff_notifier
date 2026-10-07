@@ -38,6 +38,19 @@ cp .env.example .env && chmod 600 .env
   идёт сессия одного аккаунта из `.env`: `BUFF_COOKIE`, `BUFF_CSRF`,
   `BUFF_USER_AGENT`.
 
+## Сессия аккаунта
+
+В браузере, где вы вошли на buff.market: F12 → Network → страница предмета →
+запрос `sell_order` → правой кнопкой → Copy → Copy as cURL (bash). Затем на
+сервере:
+
+```bash
+.venv/bin/python -m tools.set_session      # вставить curl, Enter, Ctrl+D
+```
+
+Куки, токен и User-Agent запишутся в `.env` (права 600), значения не
+печатаются.
+
 ## Пробник
 
 Один запрос, форма ответа и первые лоты:
