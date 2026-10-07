@@ -7,7 +7,7 @@ import pytest
 from notifier import config
 from notifier.buff import BuffError, LoginRequired
 from notifier.envfile import write_env
-from notifier.poller import Poller, daily_load, interval_minutes
+from notifier.poller import Poller, daily_load
 from notifier.store import Store
 
 NOW = datetime(2026, 10, 7, 12, tzinfo=timezone.utc)
@@ -84,17 +84,38 @@ def test_a_cheap_listing_is_alerted_once(env):
     p.cycle(NOW)
     assert len(TG.sent) == 1 and "Лот L1" in TG.sent[0]
     w = env[0].watch_list()[0]
-    assert w["sales_per_day"] == 1.0 and w["interval_min"] == 180.0, "30 sales a month: the slow end"
-    p.cycle(NOW + timedelta(hours=4))
+    assert w["sales_per_day"] == 1.0 and w["interval_min"] == 0, "low sales do not delay scanning"
+    p.cycle(NOW + timedelta(seconds=5))
     assert client.calls == [5777, 5777] and len(TG.sent) == 1
     assert env[0].recent_signals()[0]["sent"] == 1
 
 
-def test_nothing_is_asked_before_the_item_is_due(env):
-    client = Client(page())
+def test_all_items_are_scanned_without_waiting_for_old_timers_and_progress_survives_restart(env):
+    store, _, _ = env
+    store.add_watch(6000, NAME)
+    store.polled(5777, NOW, 180, 0.01)
+    store.polled(6000, NOW, 5, 1000)
+    client = Client(page(), page(), page(), page())
     p = poller(env, client)
     p.cycle(NOW)
-    assert p.cycle(NOW + timedelta(minutes=1)) > 0 and client.calls == [5777]
+    p.cycle(NOW + timedelta(seconds=5))
+    restarted = poller(env, client)
+    restarted.cycle(NOW + timedelta(seconds=10))
+    restarted.cycle(NOW + timedelta(seconds=15))
+    assert client.calls == [5777, 6000, 5777, 6000]
+    assert float(store.get_status("scan_round_seconds")) == 10
+
+
+def test_failed_items_do_not_hold_up_others_and_inactive_items_are_skipped(env):
+    store, _, _ = env
+    store.add_watch(6000, NAME)
+    store.add_watch(7000, NAME)
+    store.set_active(6000, False)
+    client = Client(BuffError("server error", 500), page(), page())
+    p = poller(env, client)
+    for seconds in (0, 5, 10):
+        p.cycle(NOW + timedelta(seconds=seconds))
+    assert client.calls == [5777, 7000, 5777]
 
 
 def test_an_expired_session_stops_polling_until_a_new_one(env):
@@ -119,15 +140,15 @@ def test_a_429_pauses_everything(env):
     assert p.cycle(NOW + timedelta(minutes=5)) == 30.0 and client.calls == [5777]
 
 
-def test_a_page_of_only_new_listings_brings_the_next_poll_closer(env):
+def test_a_page_of_only_new_listings_reports_a_gap_while_scanning_continues(env):
     store, settings, _ = env
     config.save_settings({"page_size": 2}, settings)
     client = Client(page(lot(1, 99, 0.161), lot(2, 99, 0.162)),
                     page(lot(3, 99, 0.161), lot(4, 99, 0.162)))
     p = poller(env, client)
     p.cycle(NOW)
-    p.cycle(NOW + timedelta(hours=4))
-    assert store.watch_list()[0]["interval_min"] == 5.0
+    p.cycle(NOW + timedelta(seconds=5))
+    assert store.watch_list()[0]["interval_min"] == 0
     assert "пропуск" in store.get_status("last_gap")
 
 
@@ -141,9 +162,7 @@ def test_pause_and_a_missing_database_ask_nothing(env, tmp_path):
     assert client.calls == [] and "база CSFloat" in env[0].get_status("state")
 
 
-def test_the_schedule_follows_liquidity_within_bounds():
+def test_load_is_for_a_five_minute_round_regardless_of_old_liquidity_timers():
     s = config.defaults()
-    assert interval_minutes(48, s) == 15.0
-    assert interval_minutes(1000, s) == 5.0 and interval_minutes(0, s) == 180.0
     watch = [{"active": 1, "interval_min": 15.0}, {"active": 0, "interval_min": 5.0}]
-    assert daily_load(watch, s) == (96.0, 17280.0)
+    assert daily_load(watch, s) == (288.0, 17280.0)

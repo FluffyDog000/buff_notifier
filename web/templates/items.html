@@ -6,14 +6,14 @@
   <form method="get" action="{{ url_for('items') }}">
     <input type="hidden" name="pick" value="1">
     <div class="grid">
-      <div><label for="min_rate">Продаж в сутки, от</label>
+      <div><label for="min_rate">Фильтр: продаж в сутки, от</label>
         <input id="min_rate" type="number" step="any" name="min_rate" value="{{ pick.min_rate }}"></div>
       <div><label for="min_price">Цена, от $</label>
         <input id="min_price" type="number" step="any" name="min_price" value="{{ pick.min_price }}"></div>
       <div><label for="limit">Сколько</label>
         <input id="limit" type="number" name="limit" value="{{ pick.limit }}"></div>
     </div>
-    <div class="help">Ходовые предметы по продажам CSFloat за 30 дней. Уже добавленные и паттерновые
+    <div class="help">Предметы из базы CSFloat за 30 дней. Ноль в фильтре продаж включает редкие предметы; фильтр не влияет на частоту опроса. Уже добавленные и паттерновые
       скины не предлагаются. «Премия float» — насколько самая дорогая сотая дороже самой дешёвой.</div>
     <div class="row"><button class="ghost">Показать</button></div>
   </form>
@@ -76,17 +76,17 @@
 
 <div class="card">
   <h2>Опрашиваются</h2>
+  <p class="muted">Все активные предметы проверяются по кругу с заданной паузой между запросами. Продажи в сутки показаны для справки и не влияют на очередь.</p>
   {% if not watch %}<p class="muted">Список пуст.</p>{% else %}
   <div class="scroll"><table class="cards">
-    <tr><th>Предмет</th><th>goods_id</th><th>Продаж в сутки</th><th>Интервал</th><th>Опрос</th><th></th></tr>
+    <tr><th>Предмет</th><th>goods_id</th><th>Продаж в сутки</th><th>Опрос</th><th></th></tr>
     {% for w in watch %}
     <tr>
       <td class="title">{% if not w.active %}<span class="pill">выкл</span> {% endif %}<a href="{{ url(w.name) }}" target="_blank" rel="noopener">{{ w.name }}</a>
         {% if w.last_error %}<div class="err muted">{{ w.last_error }}</div>{% endif %}</td>
       <td data-label="goods_id">{{ w.goods_id }}</td>
       <td data-label="Продаж в сутки">{{ '%.1f'|format(w.sales_per_day) if w.sales_per_day is not none else '—' }}</td>
-      <td data-label="Интервал">{{ (w.interval_min|round|int ~ ' мин') if w.interval_min else '—' }}</td>
-      <td class="muted" data-label="Опрос">был {{ ago(w.last_poll_at) }}, след. {{ ago(w.next_poll_at) if w.next_poll_at else 'сейчас' }}</td>
+      <td class="muted" data-label="Опрос">был {{ ago(w.last_poll_at) }}{% if w.active %}; следующий — по очереди{% endif %}</td>
       <td class="actions">
         <form method="post" action="{{ url_for('items_toggle', gid=w.goods_id) }}" class="inline">
           <input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost small">{{ 'выкл' if w.active else 'вкл' }}</button></form>

@@ -1,13 +1,9 @@
-"""The polling loop: one due item at a time, one request at a time.
+"""Continuous round-robin scanning of all active items, one request at a time.
 
 Each cycle re-reads settings and `.env`, so whatever the web page changes
-applies on the next item. The schedule follows the item's liquidity on
-CSFloat, the same idea as the bot's collector:
-
-    interval = poll_scale / sales per day, within [poll_min, poll_max] minutes
-
-and a page made only of listings we have not seen means some may have
-slipped past between polls: the next one comes at the minimum.
+applies on the next item. Sales on CSFloat inform valuation, never how
+long an item waits. The persisted cursor visits every active item and
+starts the next round immediately. The client's request pause sets the pace.
 
 Stops asking BuffMarket, and says so in Telegram once:
 - the session has expired (`Login Required`) - until a new one is saved;
@@ -39,15 +35,11 @@ RATE_DAYS = 30.0
 BACKOFF_429 = 15 * 60
 IDLE = 30.0
 SEARCH_EVERY = 4
+TARGET_CYCLE_MINUTES = 5.0
 
 
 def _hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
-
-
-def interval_minutes(sales_per_day: float, s: dict) -> float:
-    raw = s["poll_scale"] / max(sales_per_day, 0.01)
-    return min(max(raw, s["poll_min_minutes"]), s["poll_max_minutes"])
 
 
 class Poller:
@@ -93,7 +85,7 @@ class Poller:
 
     def request(self, kind: str, s: dict, sec: dict, now: datetime, **params) -> dict:
         """Observe normal polling/searching, without making additional requests."""
-        signature = _hash(json.dumps(buff.fingerprint(s, sec), ensure_ascii=True))
+        signature = _hash("round-robin-v1:" + json.dumps(buff.fingerprint(s, sec), ensure_ascii=True))
         mid = self.store.measurement(signature, s["request_interval"], bool(sec["BUFF_PROXY"]), now)
         client = self.client(s, sec)
         started = time.monotonic()
@@ -152,21 +144,21 @@ class Poller:
             self.store.set_status("state", f"база CSFloat недоступна: {e}")
             return 60.0
 
-        item = self.store.next_due(now)
+        item = self.store.next_in_scan()
         pending = self.store.next_pending()
-        # Searches go when no item is due, and every fifth request even when
-        # polling never pauses, so a long queue still drains.
+        # One search after four polls, or all requests when the watch list is empty.
         if pending and (item is None or self._polls_in_a_row >= SEARCH_EVERY):
             self._polls_in_a_row = 0
             self.store.set_status("state", "работает: ищу goods_id")
             return self.resolve(pending, s, sec, tg, now, cookie)
         if item is None:
             self.store.set_status("state", "работает")
-            soon = self.store.soonest()
-            return IDLE if soon is None else max(1.0, min(IDLE, (soon - now).total_seconds()))
+            return IDLE
 
         self.prune(now)
         self._polls_in_a_row += 1
+        self.store.advance_scan(item["goods_id"], now)
+        self.store.set_status("state", "работает: обход по кругу")
         return self.poll(item, s, sec, db, tg, now, cookie)
 
     def poll(self, item: dict, s: dict, sec: dict, db, tg: Telegram, now: datetime,
@@ -179,10 +171,10 @@ class Poller:
             return 0.0
         except BuffError as e:
             self.maybe_429(e, tg, self._request_finished_at or now)
-            self.store.polled(gid, now, s["poll_min_minutes"], None, str(e))
+            self.store.polled(gid, now, 0, None, str(e))
             return 0.0
         except requests.RequestException as e:
-            self.store.polled(gid, now, s["poll_min_minutes"], None, f"сеть: {e}")
+            self.store.polled(gid, now, 0, None, f"сеть: {e}")
             return 0.0
 
         self.store.set_status("session", "работает")
@@ -194,7 +186,7 @@ class Poller:
         item_id = sales.item_id(db, name)
         if item_id is None:
             self.store.mark_seen(gid, ids, now)
-            self.store.polled(gid, now, s["poll_max_minutes"], None,
+            self.store.polled(gid, now, 0, None,
                               "нет такого предмета в базе CSFloat")
             return 0.0
         rows = sales.sales_for(db, item_id, HISTORY_DAYS, now)
@@ -220,13 +212,12 @@ class Poller:
                 sent += 1
         self.store.mark_seen(gid, ids, now)
 
-        minutes = s["poll_min_minutes"] if gap else interval_minutes(rate, s)
-        self.store.polled(gid, now, minutes, rate)
+        self.store.polled(gid, now, 0, rate)
         if gap:
             self.store.set_status("last_gap", f"{name}: все {len(ids)} лотов страницы новые, "
-                                              "возможен пропуск — опрос чаще")
-        log.info("%s: лотов %d, новых %d, сигналов %d, следующий опрос через %.0f мин",
-                 name, len(ids), len(new), sent, minutes)
+                                              "возможен пропуск между обходами")
+        log.info("%s: лотов %d, новых %d, сигналов %d, проверен в обходе по кругу",
+                 name, len(ids), len(new), sent)
         return 0.0
 
     def session_expired(self, tg: Telegram, cookie: str) -> None:
@@ -287,7 +278,6 @@ class Poller:
 
 
 def daily_load(watch: list[dict], s: dict) -> tuple[float, float]:
-    """(requests a day the active list needs, requests a day the pause allows)."""
-    need = sum(1440.0 / (w["interval_min"] or s["poll_min_minutes"])
-               for w in watch if w["active"])
+    """Requests needed for a five-minute round, and the theoretical daily capacity."""
+    need = sum(1 for w in watch if w["active"]) * 1440.0 / TARGET_CYCLE_MINUTES
     return need, 86400.0 / s["request_interval"]

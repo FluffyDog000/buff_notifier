@@ -17,7 +17,7 @@
     {% else %}<div class="v err">{{ db.error }}</div><div class="muted">{{ db.path }}</div>{% endif %}
     {% if st.csfloat_pull %}<div class="muted {{ 'err' if st.csfloat_pull.value.startswith('ошибка') }}">копия с сервера бота {{ ago(st.csfloat_pull.at) }}: {{ st.csfloat_pull.value }}</div>{% endif %}</div>
   <div class="kv"><div class="k">Нагрузка</div>
-    <div class="v {{ 'err' if need > allowed else '' }}">{{ need|round|int }} запросов в сутки</div>
+    <div class="v {{ 'err' if need > allowed else '' }}">{{ need|round|int }} запросов в сутки для обхода каждые 5 минут</div>
     <div class="muted">{{ active }} предметов; при паузе {{ s.request_interval|round(1) }} с теоретический максимум {{ allowed|round|int }} без ограничений и других задержек</div></div>
   {% if st.pause_until and st.pause_until.value and st.pause_until.value > (st.heartbeat.value if st.heartbeat else '') %}
   <div class="kv"><div class="k">Пауза после 429</div><div class="v warn">до {{ st.pause_until.value[11:16] }} UTC</div></div>
@@ -26,6 +26,13 @@
   <div class="kv"><div class="k">Последний возможный пропуск</div>
     <div class="v warn" style="font-weight:500">{{ st.last_gap.value }}</div><div class="muted">{{ ago(st.last_gap.at) }}</div></div>
   {% endif %}
+</div>
+
+<div class="card">
+  <h2>Обход по кругу</h2>
+  <p>Все {{ active }} активных предметов проверяются по очереди. После последнего сразу начинается новый круг. Число продаж на CSFloat не меняет частоту проверки.</p>
+  <div class="muted">При паузе {{ s.request_interval }} с минимальное время круга — {{ scan_min_minutes|round(1) }} мин. Поиск goods_id, обработка лотов, сеть и паузы после 429 увеличивают это время.</div>
+  {% if st.scan_round_seconds %}<div>Последний завершённый круг: {{ (st.scan_round_seconds.value|float / 60)|round(1) }} мин.</div>{% endif %}
 </div>
 
 <div class="card" id="measurement">

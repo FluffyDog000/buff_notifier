@@ -127,17 +127,29 @@ class Store:
     def watch_list(self) -> list[dict]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM watch ORDER BY name")]
 
-    def next_due(self, now: datetime) -> dict | None:
-        """The active item most overdue, or None when nothing is due yet."""
+    def next_in_scan(self) -> dict | None:
+        """Next active goods_id after the persisted cursor, wrapping at the end.
+
+        Old per-item timers and sales rates have no effect on scanning.
+        Reading the candidate does not move the cursor: a search may run first.
+        """
+        cursor = int(self.get_status("scan_cursor") or 0)
         row = self.conn.execute(
-            "SELECT * FROM watch WHERE active = 1 AND (next_poll_at IS NULL OR next_poll_at <= ?) "
-            "ORDER BY next_poll_at IS NOT NULL, next_poll_at LIMIT 1", (now_iso(now),)).fetchone()
+            "SELECT * FROM watch WHERE active=1 AND goods_id>? ORDER BY goods_id LIMIT 1",
+            (cursor,)).fetchone()
+        if row is None:
+            row = self.conn.execute("SELECT * FROM watch WHERE active=1 ORDER BY goods_id LIMIT 1").fetchone()
         return dict(row) if row else None
 
-    def soonest(self) -> datetime | None:
-        row = self.conn.execute(
-            "SELECT MIN(next_poll_at) FROM watch WHERE active = 1").fetchone()
-        return datetime.fromisoformat(row[0]) if row and row[0] else None
+    def advance_scan(self, goods_id: int, now: datetime) -> None:
+        """Persist progress before requesting; a failed item cannot hold up the list."""
+        cursor = int(self.get_status("scan_cursor") or 0)
+        started = self.get_status("scan_round_started")
+        if not started or goods_id <= cursor:
+            if started:
+                self.set_status("scan_round_seconds", str(max(0, (now - datetime.fromisoformat(started)).total_seconds())))
+            self.set_status("scan_round_started", now_iso(now))
+        self.set_status("scan_cursor", str(goods_id))
 
     def polled(self, goods_id: int, now: datetime, interval_min: float,
                sales_per_day: float | None, error: str | None = None) -> None:

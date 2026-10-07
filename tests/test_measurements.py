@@ -14,7 +14,6 @@ def test_polling_records_success_limits_and_expiry_but_not_idle_cycles(env):
     client = Client(page(), BuffError("429", 429, 600), LoginRequired("expired", 200))
     p = poller(env, client)
     p.cycle(NOW)
-    p.cycle(NOW + timedelta(minutes=1))  # item is not due
     p.cycle(NOW + timedelta(hours=4))
     p.cycle(NOW + timedelta(hours=4, minutes=5))  # cooldown
     p.cycle(NOW + timedelta(hours=4, minutes=11))

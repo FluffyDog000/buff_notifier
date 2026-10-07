@@ -123,8 +123,7 @@ def test_settings_are_saved_as_typed_and_checked(app):
     form = {"csrf": csrf(c, "/settings"), "min_discount": "20", "min_profit_usd": "2",
             "float_signal": "on", "min_float_premium": "10", "normal_tolerance": "3",
             "pattern_skins": "skip", "csfloat_fee": "2", "buff_fee": "0", "usd_per_buff": "1",
-            "window_days": "16", "request_interval": "6", "poll_scale": "720",
-            "poll_min_minutes": "5", "poll_max_minutes": "180", "page_size": "10",
+            "window_days": "16", "request_interval": "6", "page_size": "10",
             "csfloat_db": str(app.tmp / "csfloat.db")}
     assert c.post("/settings", data=form).status_code == 302
     s = config.load_settings(app.tmp / "settings.json")
@@ -134,6 +133,15 @@ def test_settings_are_saved_as_typed_and_checked(app):
     r = c.post("/settings", data=bad)
     assert r.status_code == 400 and "не число" in r.get_data(as_text=True)
     assert config.load_settings(app.tmp / "settings.json")["min_discount"] == 0.2
+
+
+def test_overview_items_and_settings_explain_continuous_scanning(app):
+    c = logged_in(app)
+    assert "Обход по кругу" in c.get("/").get_data(as_text=True)
+    assert "не влияют на очередь" in c.get("/items").get_data(as_text=True)
+    body = c.get("/settings").get_data(as_text=True)
+    assert 'name="poll_scale"' not in body and 'name="poll_max_minutes"' not in body
+    assert "Опрос идёт непрерывно по кругу" in body
 
 
 def test_the_session_comes_from_curl_and_never_back_to_the_page(app):

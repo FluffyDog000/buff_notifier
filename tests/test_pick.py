@@ -132,6 +132,8 @@ def test_a_long_queue_still_drains_while_items_are_always_due(tmp_path):
     for _ in range(5):
         p.cycle(NOW)
     assert len(client.polled) == 4 and len(client.searched) == 1
+    p.cycle(NOW)
+    assert client.polled == [1, 2, 3, 4, 5], "searching must not skip the next item in the round"
 
 
 def test_the_page_picks_and_queues(tmp_path):

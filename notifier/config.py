@@ -83,13 +83,6 @@ FIELDS: tuple[Field, ...] = (
     Field("request_interval", "float", 5.0, "Пауза между запросами к BuffMarket, с",
           "Все запросы идут по одному. Ограничивает сайт — увеличьте.", 1, 600,
           group="Опрос"),
-    Field("poll_scale", "float", 720.0, "Интервал опроса = N / продаж в сутки, мин",
-          "Предмет с 48 продажами в сутки при N = 720 опрашивается раз в 15 минут.",
-          1, 100000, group="Опрос"),
-    Field("poll_min_minutes", "float", 5.0, "Опрос не чаще, чем раз в, мин", "", 1, 1440,
-          group="Опрос"),
-    Field("poll_max_minutes", "float", 180.0, "Опрос не реже, чем раз в, мин", "", 1, 10080,
-          group="Опрос"),
     Field("page_size", "int", 10, "Лотов за запрос",
           "Сколько новейших лотов брать за один запрос.", 1, 50, group="Опрос"),
     Field("paused", "bool", False, "Пауза: не опрашивать BuffMarket", group="Опрос"),
@@ -167,8 +160,6 @@ def parse_form(form) -> tuple[dict, dict]:
             values[f.key] = _coerce(f, raw)
         except (TypeError, ValueError) as e:
             errors[f.key] = str(e) if str(e) and "could not" not in str(e) else "не число"
-    if not errors and values.get("poll_min_minutes", 0) > values.get("poll_max_minutes", 1e9):
-        errors["poll_min_minutes"] = "больше, чем «не реже»"
     return values, errors
 
 
