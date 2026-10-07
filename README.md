@@ -4,57 +4,50 @@
 дорогой float по обычной цене. «Рынок» — история продаж CSFloat из базы
 CSFloat-бота. Вводная — `csfloatpricesparcing/docs/BUFF_NOTIFIER.md`.
 
+Установка, веб-панель и DuckDNS — **[docs/DEPLOY.md](docs/DEPLOY.md)**.
+
 ## Рамки
 
-- Один аккаунт, один постоянный адрес, обычный темп. Ограничивает сайт —
-  сокращаем список или частоту, а не размножаем аккаунты.
+- Один аккаунт, один постоянный адрес (свой или один постоянный прокси),
+  обычный темп. Ограничивает сайт — сокращаем список или частоту, а не
+  размножаем аккаунты и адреса.
 - База CSFloat-бота только читается (`mode=ro`). Сам бот не меняется.
 
-## На сервере
+## Как устроено
 
 ```
-/root/csfloatpricesparcing           CSFloat-бот, база в data/csfloat_sales.db
-/root/buff_notifier                  этот сервис
+run_notifier.py   служба опроса: предмет, чей срок подошёл → sell_order →
+                  оценка лотов → Telegram (по лоту не больше одного раза)
+run_web.py        веб-панель на 127.0.0.1:5050: настройки, сессия, прокси,
+                  Telegram, список предметов, сигналы
+data/settings.json  пороги, комиссии, темп — правятся из панели
+data/buff.db        список предметов, виденные лоты, сигналы, состояние
+.env (600)          сессия BuffMarket, прокси, токен Telegram, хэш пароля
 ```
+
+Обе службы читают настройки и `.env` заново на каждом шаге: изменения из
+панели действуют без перезапуска.
+
+- `notifier/judge.py` — два сигнала. Рынок — продажи CSFloat за окно по
+  ликвидности (16 дней, для редких 30/45), приведённые к сегодняшним ценам,
+  медиана сотой float лота. Без 5 продаж в сотой лот не оценивается.
+  Паттерновые скины (Fade, Marble Fade, Case Hardened, Crimson Web) — пропуск.
+- `notifier/poller.py` — интервал опроса = N / продаж в сутки на CSFloat, в
+  пределах [мин, макс]. Истёкшая сессия и 429 останавливают запросы и один
+  раз пишут в Telegram.
+- `notifier/estimate.py`, `recency.py`, `phases.py` — перенесены из
+  `csfloatpricesparcing/src` (коммит в шапке файла) без изменений в логике.
+  Перенос, а не импорт по пути: перестановка внутри бота не должна молча
+  ломать уведомления. Связь с ботом — только схема базы.
+- `notifier/buff.py`, `listings.py` — запрос страницы предмета
+  `api.buff.market/api/market/goods/sell_order` и разбор ответа (образец в
+  `tests/fixtures`). Без входа сайт отвечает `Login Required`.
+
+## Инструменты
 
 ```bash
-cd /root/buff_notifier
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-cp .env.example .env && chmod 600 .env
+.venv/bin/python -m tools.set_password        # пароль веб-панели
+.venv/bin/python -m tools.set_session         # сессия из «Copy as cURL» (или в панели)
+.venv/bin/python -m tools.probe 5777          # один запрос: форма ответа и лоты
 .venv/bin/python -m pytest -q
-```
-
-## Что откуда
-
-- `notifier/estimate.py`, `notifier/recency.py`, `notifier/phases.py` —
-  перенесены из `csfloatpricesparcing/src` (коммит в шапке файла) без изменений
-  в логике: медиана по сотой float, пересчёт к сегодняшним ценам, фазы
-  Doppler. Перенос, а не импорт по пути: перестановка внутри бота не должна
-  молча ломать уведомления. Связь с ботом — только схема базы.
-- `notifier/sales.py` — чтение `items` и `sales` на чтение, с `age_days`.
-- `notifier/buff.py` — запрос страницы предмета
-  `api.buff.market/api/market/goods/sell_order`, по одному, с паузой
-  `BUFF_MIN_INTERVAL`. Без входа сайт отвечает `Login Required`, поэтому
-  идёт сессия одного аккаунта из `.env`: `BUFF_COOKIE`, `BUFF_CSRF`,
-  `BUFF_USER_AGENT`.
-
-## Сессия аккаунта
-
-В браузере, где вы вошли на buff.market: F12 → Network → страница предмета →
-запрос `sell_order` → правой кнопкой → Copy → Copy as cURL (bash). Затем на
-сервере:
-
-```bash
-.venv/bin/python -m tools.set_session      # вставить curl, Enter, Ctrl+D
-```
-
-Куки, токен и User-Agent запишутся в `.env` (права 600), значения не
-печатаются.
-
-## Пробник
-
-Один запрос, форма ответа и первые лоты:
-
-```bash
-.venv/bin/python -m tools.probe 5777 --save probe.json
 ```

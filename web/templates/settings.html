@@ -1,0 +1,90 @@
+{% extends "base.html" %}{% block title %}Настройки{% endblock %}
+{% block body %}
+<h1>Настройки</h1>
+
+<div class="card" id="session">
+  <h2>Сессия BuffMarket</h2>
+  <p>Сейчас: <b>{{ session_state }}</b>{% if sec.BUFF_COOKIE %} <span class="muted">(куки {{ mask(sec.BUFF_COOKIE) }})</span>{% endif %}</p>
+  <form method="post" action="{{ url_for('session_save') }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label for="curl">Вставьте «Copy as cURL» запроса <code>sell_order</code></label>
+    <textarea id="curl" name="curl" autocomplete="off" spellcheck="false"></textarea>
+    <div class="help">На компьютере, где вы вошли на buff.market: страница предмета → F12 → Network →
+      обновить страницу → строка <code>sell_order</code> → правой кнопкой → Copy → Copy as cURL.
+      На iPhone куки так не получить. Значения хранятся в <code>.env</code> на сервере и сюда не возвращаются.</div>
+    <div class="row"><button>Сохранить сессию</button></div>
+  </form>
+  <form method="post" action="{{ url_for('session_test') }}" class="row">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost">Проверить</button>
+    <span class="muted">один запрос к BuffMarket</span>
+  </form>
+</div>
+
+<div class="card" id="proxy">
+  <h2>Прокси</h2>
+  <p>Сейчас: <b>{{ proxy or 'нет, адрес сервера' }}</b></p>
+  <form method="post" action="{{ url_for('proxy_save') }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label for="proxy_url">Один постоянный прокси</label>
+    <input id="proxy_url" type="text" name="proxy" placeholder="http://логин:пароль@host:port или socks5://…" autocomplete="off">
+    <div class="help">Только один адрес и только постоянный — не ротационный: сайт должен видеть
+      обычного посетителя. Если сайт ограничивает — сократите список или увеличьте паузу,
+      а не меняйте адреса.</div>
+    <div class="row"><button>Сохранить</button>{% if proxy %}<button class="danger" name="clear" value="1">Убрать прокси</button>{% endif %}</div>
+  </form>
+  <form method="post" action="{{ url_for('proxy_test') }}" class="row">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost">Проверить</button>
+    <span class="muted">покажет адрес, который видят сайты</span>
+  </form>
+</div>
+
+<div class="card" id="telegram">
+  <h2>Telegram</h2>
+  <form method="post" action="{{ url_for('telegram_save') }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label for="token">Токен бота {% if sec.TELEGRAM_BOT_TOKEN %}<span class="muted">(задан, {{ mask(sec.TELEGRAM_BOT_TOKEN) }})</span>{% endif %}</label>
+    <input id="token" type="password" name="token" placeholder="{{ 'оставьте пустым, чтобы не менять' if sec.TELEGRAM_BOT_TOKEN else '123456:ABC…' }}" autocomplete="off">
+    <div class="help">От @BotFather. Можно отдельного бота, можно того же, что у CSFloat-бота.</div>
+    <label for="chat">Chat id</label>
+    <input id="chat" type="text" name="chat_id" value="{{ sec.TELEGRAM_CHAT_ID }}">
+    <div class="row"><button>Сохранить</button></div>
+  </form>
+  <div class="row">
+    <form method="post" action="{{ url_for('telegram_chats') }}" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost">Найти chat id</button></form>
+    <form method="post" action="{{ url_for('telegram_test') }}" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost">Тестовое сообщение</button></form>
+  </div>
+  <div class="help">Чтобы найти chat id: напишите боту /start, затем «Найти chat id».</div>
+</div>
+
+<form method="post" action="{{ url_for('settings_save') }}">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  {% for g in groups %}
+  <div class="card">
+    <h2>{{ g }}</h2>
+    {% for f in fields if f.group == g %}
+      {% if f.kind == 'bool' %}
+        <label class="check"><input type="checkbox" name="{{ f.key }}" {{ 'checked' if s[f.key] }}> {{ f.label }}</label>
+      {% else %}
+        <label for="{{ f.key }}">{{ f.label }}</label>
+        {% if f.kind == 'choice' %}
+          <select id="{{ f.key }}" name="{{ f.key }}">
+            {% for v, t in f.choices %}<option value="{{ v }}" {{ 'selected' if s[f.key] == v }}>{{ t }}</option>{% endfor %}
+          </select>
+        {% elif f.kind == 'pct' %}
+          <input id="{{ f.key }}" type="number" step="any" name="{{ f.key }}" value="{{ '%g'|format(s[f.key] * 100) }}">
+        {% elif f.kind == 'str' %}
+          <input id="{{ f.key }}" type="text" name="{{ f.key }}" value="{{ s[f.key] }}">
+        {% else %}
+          <input id="{{ f.key }}" type="number" step="any" name="{{ f.key }}" value="{{ '%g'|format(s[f.key]) }}">
+        {% endif %}
+      {% endif %}
+      {% if errors.get(f.key) %}<div class="fielderr">{{ errors[f.key] }}</div>{% endif %}
+      {% if f.help %}<div class="help">{{ f.help }}</div>{% endif %}
+    {% endfor %}
+  </div>
+  {% endfor %}
+  <div class="row" style="margin-bottom:24px"><button>Сохранить настройки</button></div>
+</form>
+{% endblock %}
