@@ -132,7 +132,7 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
         return render_template("index.html", st=st, alive=alive, beat=beat,
                                db=csfloat_info(s["csfloat_db"]), need=need, allowed=allowed,
                                active=sum(1 for w in watch if w["active"]),
-                               signals=store.recent_signals(100), s=s)
+                               signals=store.recent_signals(100), s=s, metrics=store.measurement_stats())
 
     # -- items ------------------------------------------------------------------
 

@@ -16,9 +16,11 @@ Stops asking BuffMarket, and says so in Telegram once:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -60,6 +62,7 @@ class Poller:
         self._db, self._db_path = None, None
         self._pruned: datetime | None = None
         self._polls_in_a_row = 0
+        self._request_finished_at: datetime | None = None
 
     # -- helpers --------------------------------------------------------------
 
@@ -87,6 +90,35 @@ class Poller:
             return
         if tg.send(text) or not tg.configured():
             self.store.set_status(key, marker)
+
+    def request(self, kind: str, s: dict, sec: dict, now: datetime, **params) -> dict:
+        """Observe normal polling/searching, without making additional requests."""
+        signature = _hash(json.dumps(buff.fingerprint(s, sec), ensure_ascii=True))
+        mid = self.store.measurement(signature, s["request_interval"], bool(sec["BUFF_PROXY"]), now)
+        client = self.client(s, sec)
+        started = time.monotonic()
+        self._request_finished_at = None
+
+        def record(outcome, status=None, retry=None, pause=None):
+            self._request_finished_at = now + timedelta(seconds=time.monotonic() - started)
+            self.store.record_request(mid, self._request_finished_at, kind, outcome, status, retry, pause)
+
+        try:
+            body = (client.sell_orders(params["goods_id"], page_size=params["page_size"])
+                    if kind == "poll" else client.search_goods(params["query"]))
+        except LoginRequired as e:
+            record("expired", e.status)
+            raise
+        except BuffError as e:
+            limited = e.status == 429
+            record("limited" if limited else "error", e.status, e.retry_after,
+                   (e.retry_after if e.retry_after is not None else BACKOFF_429) if limited else None)
+            raise
+        except requests.RequestException:
+            record("network_error")
+            raise
+        record("ok", 200)
+        return body
 
     # -- one cycle ------------------------------------------------------------
 
@@ -141,12 +173,12 @@ class Poller:
              cookie: str) -> float:
         gid, name = item["goods_id"], item["name"]
         try:
-            body = self.client(s, sec).sell_orders(gid, page_size=s["page_size"])
+            body = self.request("poll", s, sec, now, goods_id=gid, page_size=s["page_size"])
         except LoginRequired:
             self.session_expired(tg, cookie)
             return 0.0
         except BuffError as e:
-            self.maybe_429(e, tg, now)
+            self.maybe_429(e, tg, self._request_finished_at or now)
             self.store.polled(gid, now, s["poll_min_minutes"], None, str(e))
             return 0.0
         except requests.RequestException as e:
@@ -208,7 +240,7 @@ class Poller:
     def maybe_429(self, e: BuffError, tg: Telegram, now: datetime) -> None:
         if e.status != 429:
             return
-        wait = e.retry_after or BACKOFF_429
+        wait = e.retry_after if e.retry_after is not None else BACKOFF_429
         until = now_iso(now + timedelta(seconds=wait))
         self.store.set_status("pause_until", until)
         self.store.set_status("last_429", until)
@@ -225,12 +257,12 @@ class Poller:
         name = p["name"]
         base = phases.split(name)[0]
         try:
-            body = self.client(s, sec).search_goods(base)
+            body = self.request("search", s, sec, now, query=base)
         except LoginRequired:
             self.session_expired(tg, cookie)
             return 0.0
         except BuffError as e:
-            self.maybe_429(e, tg, now)
+            self.maybe_429(e, tg, self._request_finished_at or now)
             self.store.fail_pending(name, str(e))
             return 0.0
         except requests.RequestException as e:
@@ -250,6 +282,7 @@ class Poller:
     def prune(self, now: datetime) -> None:
         if self._pruned is None or now - self._pruned > timedelta(hours=1):
             self.store.prune_seen(now)
+            self.store.prune_requests(now)
             self._pruned = now
 
 

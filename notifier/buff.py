@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import threading
 import time
+import math
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 
@@ -46,6 +49,23 @@ class BuffError(RuntimeError):
 
 class LoginRequired(BuffError):
     """The session is missing or has expired: a new Cookie is needed."""
+
+
+def retry_after_seconds(value: str | None, now: datetime | None = None) -> float | None:
+    """Retry-After may be either seconds or an HTTP date."""
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            return max(0.0, (date - (now or datetime.now(timezone.utc))).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            return None
 
 
 class BuffClient:
@@ -87,7 +107,7 @@ class BuffClient:
         if r.status_code == 429:
             ra = r.headers.get("Retry-After")
             raise BuffError("BuffMarket: 429, слишком часто", 429,
-                            float(ra) if ra and ra.isdigit() else None)
+                            retry_after_seconds(ra))
         if r.status_code != 200:
             raise BuffError(f"BuffMarket: HTTP {r.status_code}", r.status_code)
         try:

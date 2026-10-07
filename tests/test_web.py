@@ -83,6 +83,18 @@ def test_everything_but_login_needs_the_password(app):
     assert c.get("/").status_code == 200
 
 
+def test_measurements_are_displayed_without_credentials(app):
+    from datetime import datetime, timezone
+    store = Store(app.tmp / "buff.db")
+    now = datetime.now(timezone.utc)
+    mid = store.measurement("opaque-digest", 5, True, now)
+    store.record_request(mid, now, "poll", "limited", 429, None, 900)
+    body = logged_in(app).get("/").get_data(as_text=True)
+    assert "Замер запросов и ограничений" in body and "Первое через" in body
+    assert "не указано" in body and "900 с" in body
+    assert "opaque-digest" not in body
+
+
 def test_five_wrong_passwords_lock_the_address(app):
     c = app.test_client()
     for _ in range(5):

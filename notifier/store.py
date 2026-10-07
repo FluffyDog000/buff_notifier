@@ -63,6 +63,33 @@ CREATE TABLE IF NOT EXISTS status (
     value         TEXT,
     at            TEXT
 );
+CREATE TABLE IF NOT EXISTS measurements (
+    id            INTEGER PRIMARY KEY,
+    signature     TEXT NOT NULL,
+    started_at    TEXT NOT NULL,
+    last_at       TEXT,
+    interval_sec  REAL NOT NULL,
+    proxy         INTEGER NOT NULL,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    poll_ok       INTEGER NOT NULL DEFAULT 0,
+    search_ok     INTEGER NOT NULL DEFAULT 0,
+    limited       INTEGER NOT NULL DEFAULT 0,
+    errors        INTEGER NOT NULL DEFAULT 0,
+    first_429_at  TEXT,
+    before_429    INTEGER
+);
+CREATE TABLE IF NOT EXISTS request_events (
+    id            INTEGER PRIMARY KEY,
+    measurement_id INTEGER NOT NULL,
+    at            TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    outcome       TEXT NOT NULL,
+    http_status   INTEGER,
+    retry_after   REAL,
+    pause_seconds REAL
+);
+CREATE INDEX IF NOT EXISTS idx_request_events_time ON request_events(at);
+CREATE INDEX IF NOT EXISTS idx_request_events_measurement ON request_events(measurement_id, at);
 """
 
 
@@ -205,6 +232,76 @@ class Store:
     def recent_signals(self, limit: int = 50) -> list[dict]:
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))]
+
+    # -- passive measurement of the notifier's requests ----------------------
+
+    def measurement(self, signature: str, interval_sec: float, proxy: bool,
+                    now: datetime) -> int:
+        """Reuse the current run across restarts; changing its inputs starts a run.
+
+        The signature is a digest. No cookies, proxy credentials or response
+        bodies are stored here.
+        """
+        with self.lock, self.conn:
+            row = self.conn.execute("SELECT id, signature FROM measurements ORDER BY id DESC LIMIT 1").fetchone()
+            if row and row["signature"] == signature:
+                return row["id"]
+            cur = self.conn.execute(
+                "INSERT INTO measurements(signature, started_at, interval_sec, proxy) VALUES (?,?,?,?)",
+                (signature, now_iso(now), interval_sec, int(proxy)))
+            return cur.lastrowid
+
+    def record_request(self, measurement_id: int, now: datetime, kind: str,
+                       outcome: str, http_status: int | None = None,
+                       retry_after: float | None = None, pause_seconds: float | None = None) -> None:
+        with self.lock, self.conn:
+            self.conn.execute(
+                "INSERT INTO request_events(measurement_id, at, kind, outcome, http_status, "
+                "retry_after, pause_seconds) VALUES (?,?,?,?,?,?,?)",
+                (measurement_id, now_iso(now), kind, outcome, http_status, retry_after, pause_seconds))
+            self.conn.execute(
+                "UPDATE measurements SET last_at = ?, attempts = attempts + 1, "
+                "poll_ok = poll_ok + ?, search_ok = search_ok + ?, limited = limited + ?, "
+                "errors = errors + ?, "
+                "before_429 = CASE WHEN ? AND first_429_at IS NULL THEN attempts ELSE before_429 END, "
+                "first_429_at = CASE WHEN ? AND first_429_at IS NULL THEN ? ELSE first_429_at END "
+                "WHERE id = ?",
+                (now_iso(now), int(outcome == "ok" and kind == "poll"),
+                 int(outcome == "ok" and kind == "search"), int(outcome == "limited"),
+                 int(outcome not in ("ok", "limited")), outcome == "limited", outcome == "limited",
+                 now_iso(now), measurement_id))
+
+    def measurement_stats(self, now: datetime | None = None) -> dict:
+        now = now or datetime.now(timezone.utc)
+        row = self.conn.execute("SELECT * FROM measurements ORDER BY id DESC LIMIT 1").fetchone()
+        if row is None:
+            return {"current": None, "history": [], "limits": []}
+        current = dict(row)
+        start = datetime.fromisoformat(current["started_at"])
+        current["minutes"] = max(0, (now - start).total_seconds() / 60)
+        current["first_429_minutes"] = ((datetime.fromisoformat(current["first_429_at"]) - start)
+                                          .total_seconds() / 60 if current["first_429_at"] else None)
+        hour = now_iso(max(start, now - timedelta(hours=1)))
+        current["hour"] = dict(self.conn.execute(
+            "SELECT COUNT(*) AS attempts, "
+            "COALESCE(SUM(outcome='ok' AND kind='poll'),0) AS polls, "
+            "COALESCE(SUM(outcome='ok' AND kind='search'),0) AS searches, "
+            "COALESCE(SUM(outcome='limited'),0) AS limited "
+            "FROM request_events WHERE measurement_id=? AND at>=? AND at<=?",
+            (current["id"], hour, now_iso(now))).fetchone())
+        return {"current": current,
+                "history": [dict(r) for r in self.conn.execute(
+                    "SELECT * FROM measurements ORDER BY id DESC LIMIT 5")],
+                "limits": [dict(r) for r in self.conn.execute(
+                    "SELECT at, http_status, retry_after, pause_seconds FROM request_events "
+                    "WHERE measurement_id=? AND outcome='limited' ORDER BY id DESC LIMIT 10",
+                    (current["id"],))]}
+
+    def prune_requests(self, now: datetime) -> None:
+        """Keep seven days of individual events; cumulative runs remain intact."""
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM request_events WHERE at < ?",
+                              (now_iso(now - timedelta(days=7)),))
 
     # -- status ---------------------------------------------------------------
 

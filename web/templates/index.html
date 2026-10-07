@@ -18,7 +18,7 @@
     {% if st.csfloat_pull %}<div class="muted {{ 'err' if st.csfloat_pull.value.startswith('ошибка') }}">копия с сервера бота {{ ago(st.csfloat_pull.at) }}: {{ st.csfloat_pull.value }}</div>{% endif %}</div>
   <div class="kv"><div class="k">Нагрузка</div>
     <div class="v {{ 'err' if need > allowed else '' }}">{{ need|round|int }} запросов в сутки</div>
-    <div class="muted">{{ active }} предметов; при паузе {{ s.request_interval|round(1) }} с успеваем {{ allowed|round|int }}</div></div>
+    <div class="muted">{{ active }} предметов; при паузе {{ s.request_interval|round(1) }} с теоретический максимум {{ allowed|round|int }} без ограничений и других задержек</div></div>
   {% if st.pause_until and st.pause_until.value and st.pause_until.value > (st.heartbeat.value if st.heartbeat else '') %}
   <div class="kv"><div class="k">Пауза после 429</div><div class="v warn">до {{ st.pause_until.value[11:16] }} UTC</div></div>
   {% endif %}
@@ -26,6 +26,35 @@
   <div class="kv"><div class="k">Последний возможный пропуск</div>
     <div class="v warn" style="font-weight:500">{{ st.last_gap.value }}</div><div class="muted">{{ ago(st.last_gap.at) }}</div></div>
   {% endif %}
+</div>
+
+<div class="card" id="measurement">
+  <h2>Замер запросов и ограничений</h2>
+  <p class="muted">Считаются запросы службы опроса: лоты и поиск goods_id. Смена сессии, прокси или паузы начинает новый замер. Проверки из настроек и командной строки сюда не входят.</p>
+  {% set m = metrics.current %}
+  {% if not m %}<p class="muted">Замер начнётся с первого запроса службы после обновления.</p>
+  {% else %}
+  <div class="grid">
+    <div class="kv"><div class="k">Текущий замер</div><div class="v">{{ m.minutes|round(1) }} мин · пауза {{ m.interval_sec|round(1) }} с</div>
+      <div class="muted">{{ 'Через прокси' if m.proxy else 'С адреса сервера' }}; начат {{ ago(m.started_at) }}</div></div>
+    <div class="kv"><div class="k">Успешные запросы</div><div class="v">{{ m.poll_ok + m.search_ok }} из {{ m.attempts }}</div>
+      <div class="muted">Лоты: {{ m.poll_ok }}; поиск: {{ m.search_ok }}; другие ошибки: {{ m.errors }}</div></div>
+    <div class="kv"><div class="k">Ограничения 429</div><div class="v {{ 'warn' if m.limited }}">{{ m.limited }}</div>
+      {% if m.first_429_at %}<div class="muted">Первое через {{ m.first_429_minutes|round(1) }} мин, перед ним {{ m.before_429 }} запросов</div>
+      {% else %}<div class="muted">За этот замер ограничений ещё не было; предел не установлен.</div>{% endif %}</div>
+    <div class="kv"><div class="k">Фактически за последний час</div><div class="v">{{ m.hour.polls }} опросов · {{ m.hour.searches }} поисков</div>
+      <div class="muted">429: {{ m.hour.limited }}. {% if m.minutes < 60 %}С начала замера прошло меньше часа.{% else %}Включая время ожидания и пауз.{% endif %}</div></div>
+  </div>
+  {% if metrics.limits %}<details class="row"><summary>Последние ограничения</summary>
+    <div class="scroll"><table><tr><th>Когда</th><th>Ожидание из ответа</th><th>Пауза бота</th></tr>
+    {% for e in metrics.limits %}<tr><td>{{ ago(e.at) }}</td><td>{{ (e.retry_after|round|int ~ ' с') if e.retry_after is not none else 'не указано' }}</td><td>{{ e.pause_seconds|round|int }} с</td></tr>{% endfor %}
+    </table></div></details>{% endif %}
+  {% if metrics.history|length > 1 %}<details class="row"><summary>Предыдущие замеры</summary>
+    <div class="scroll"><table><tr><th>Начало</th><th>Пауза</th><th>Запросы</th><th>429</th></tr>
+    {% for h in metrics.history[1:] %}<tr><td>{{ ago(h.started_at) }}</td><td>{{ h.interval_sec }} с</td><td>{{ h.attempts }}</td><td>{{ h.limited }}</td></tr>{% endfor %}
+    </table></div></details>{% endif %}
+  {% endif %}
+  <p class="muted">Цель: 2000–3000 предметов каждые 5 минут — 24 000–36 000 запросов в час при одной странице на предмет. Этот замер показывает текущую связку аккаунта и адреса; он не определяет, к чему Buff привязывает лимит.</p>
 </div>
 
 <div class="card">
