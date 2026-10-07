@@ -24,6 +24,7 @@ import requests
 
 API = "https://api.buff.market"
 SELL_ORDER = "/api/market/goods/sell_order"
+SEARCH = "/api/market/goods"
 # The page's own headers, minus anything tied to a session.
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -76,15 +77,12 @@ class BuffClient:
                 self._sleep(left)
         self._last = self._clock()
 
-    def sell_orders(self, goods_id: int, page_size: int = 10, page_num: int = 1,
-                    sort_by: str = "created.desc") -> dict:
-        """The newest listings of one item, as the item page asks for them:
-        the answer's JSON, once its `code` says it is one."""
-        params = {"game": "csgo", "page_num": page_num, "page_size": page_size,
-                  "goods_id": goods_id, "sort_by": sort_by}
+    def _get(self, path: str, params: dict) -> dict:
+        """One request, after the pause; the answer's JSON once its `code`
+        says it is one."""
         with self._lock:
             self._wait()
-            r = self.session.get(API + SELL_ORDER, params=params, timeout=self.timeout)
+            r = self.session.get(API + path, params=params, timeout=self.timeout)
             self.last = r
         if r.status_code == 429:
             ra = r.headers.get("Retry-After")
@@ -103,6 +101,19 @@ class BuffClient:
         if code not in (None, "OK"):
             raise BuffError(f"BuffMarket: {code}: {body.get('error')}", r.status_code, code=code)
         return body
+
+    def sell_orders(self, goods_id: int, page_size: int = 10, page_num: int = 1,
+                    sort_by: str = "created.desc") -> dict:
+        """The newest listings of one item, as the item page asks for them."""
+        return self._get(SELL_ORDER, {"game": "csgo", "page_num": page_num,
+                                      "page_size": page_size, "goods_id": goods_id,
+                                      "sort_by": sort_by})
+
+    def search_goods(self, query: str, page_size: int = 20) -> dict:
+        """The market's item search: what the search box on buff.market asks.
+        Same shape as Buff163's: data.items[] with `id` and `market_hash_name`."""
+        return self._get(SEARCH, {"game": "csgo", "page_num": 1, "page_size": page_size,
+                                  "search": query})
 
 
 def from_config(settings: dict, secrets: dict, **kw) -> BuffClient:
@@ -131,3 +142,14 @@ def proxy_display(url: str) -> str:
     scheme, _, rest = url.partition("://")
     host = rest.rsplit("@", 1)[-1]
     return f"{scheme}://{host}" if rest else url.rsplit("@", 1)[-1]
+
+
+def match_goods(body: dict, name: str) -> int | None:
+    """The goods_id whose market_hash_name is exactly `name`, from a search answer."""
+    for it in (body.get("data") or {}).get("items") or []:
+        if isinstance(it, dict) and it.get("market_hash_name") == name and it.get("id") is not None:
+            try:
+                return int(it["id"])
+            except (TypeError, ValueError):
+                return None
+    return None

@@ -26,7 +26,7 @@ from flask import (Flask, abort, flash, redirect, render_template, request, sess
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
-from notifier import buff, config, sales
+from notifier import buff, candidates, config, sales
 from notifier.buff import BuffError, LoginRequired
 from notifier.envfile import write_env
 from notifier.listings import item_url
@@ -139,21 +139,54 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
     @app.route("/items")
     def items():
         s = settings()
+        pick_args = {"min_rate": request.args.get("min_rate", "5"),
+                     "min_price": request.args.get("min_price", "5"),
+                     "limit": request.args.get("limit", "50")}
+        picked = None
+        if request.args.get("pick"):
+            try:
+                watched = {w["name"] for w in store.watch_list()}
+                watched |= {p["name"] for p in store.pending_list()}
+                conn = sales.connect(s["csfloat_db"])
+                picked = candidates.pick(conn, s, float(pick_args["min_rate"].replace(",", ".")),
+                                         float(pick_args["min_price"].replace(",", ".")),
+                                         int(pick_args["limit"]), exclude=watched)
+                conn.close()
+            except (ValueError, sqlite3.Error) as e:
+                flash(f"Не подобрал: {e}", "error")
         return render_template("items.html", watch=store.watch_list(), names=csfloat_names(s),
+                               pending=store.pending_list(), picked=picked, pick=pick_args,
                                url=item_url)
+
+    @app.route("/items/queue", methods=["POST"])
+    def items_queue():
+        names = [n for n in request.form.get("names", "").splitlines() if n.strip()]
+        n = store.add_pending(names)
+        flash(f"В очередь поиска: {n}. Сервис найдёт goods_id сам, по одному запросу "
+              f"в паузах между опросами.", "ok")
+        return redirect(url_for("items"))
+
+    @app.route("/items/pending/remove", methods=["POST"])
+    def pending_remove():
+        store.remove_pending(request.form.get("name") or None)
+        return redirect(url_for("items"))
 
     @app.route("/items/add", methods=["POST"])
     def items_add():
         s, sec = settings(), secrets()
         lines = [ln.strip() for ln in request.form.get("lines", "").splitlines() if ln.strip()]
         known = set(csfloat_names(s))
-        added, lookups, client = [], 0, None
+        added, lookups, client, queued = [], 0, None, []
         for ln in lines:
             gid_text, _, name = ln.partition(";")
             try:
                 gid = int(gid_text.strip())
             except ValueError:
-                flash(f"«{ln}»: в начале строки должен быть goods_id", "error")
+                # A bare name: its goods_id is for the notifier to find.
+                if known and ln not in known:
+                    flash(f"«{ln}» нет среди предметов CSFloat-бота.", "error")
+                else:
+                    queued.append(ln)
                 continue
             name = name.strip()
             if not name:
@@ -179,6 +212,8 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
             added.append(name)
         if added:
             flash(f"Добавлено: {', '.join(added)}", "ok")
+        if queued:
+            flash(f"В очередь поиска goods_id: {store.add_pending(queued)}.", "ok")
         return redirect(url_for("items"))
 
     @app.route("/items/<int:gid>/toggle", methods=["POST"])

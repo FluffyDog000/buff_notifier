@@ -49,5 +49,7 @@ data/buff.db        список предметов, виденные лоты, 
 .venv/bin/python -m tools.set_password        # пароль веб-панели
 .venv/bin/python -m tools.set_session         # сессия из «Copy as cURL» (или в панели)
 .venv/bin/python -m tools.probe 5777          # один запрос: форма ответа и лоты
+.venv/bin/python -m tools.find_goods "AK-47 | Redline (Field-Tested)"   # goods_id по названию
+.venv/bin/python -m tools.pull_csfloat        # копия базы бота с его сервера
 .venv/bin/python -m pytest -q
 ```

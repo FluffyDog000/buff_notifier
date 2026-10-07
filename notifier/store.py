@@ -5,6 +5,8 @@
     seen     - listing ids already read, to tell new ones from old (30 days)
     signals  - every alert ever made, one per listing - the "never twice"
     status   - small facts for the page: last cycle, session state, pause
+    pending  - names waiting for their goods_id, found by the notifier between
+               polls, one search at a time
 """
 from __future__ import annotations
 
@@ -49,6 +51,12 @@ CREATE TABLE IF NOT EXISTS signals (
     text          TEXT,
     created_at    TEXT NOT NULL,
     sent          INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS pending (
+    name          TEXT PRIMARY KEY,          -- CSFloat market_hash_name (phase name allowed)
+    added_at      TEXT NOT NULL,
+    tries         INTEGER NOT NULL DEFAULT 0,
+    error         TEXT                       -- why the last search found nothing
 );
 CREATE TABLE IF NOT EXISTS status (
     key           TEXT PRIMARY KEY,
@@ -114,6 +122,44 @@ class Store:
                 "polls = polls + CASE WHEN ? IS NULL THEN 1 ELSE 0 END WHERE goods_id = ?",
                 (now_iso(now), now_iso(now + timedelta(minutes=interval_min)), interval_min,
                  sales_per_day, error, error, now_iso(now), error, goods_id))
+
+    # -- names waiting for a goods_id -----------------------------------------
+
+    def add_pending(self, names) -> int:
+        """Queue names not yet watched or queued. Returns how many were new."""
+        watched = {w["name"] for w in self.watch_list()}
+        fresh = [n.strip() for n in names if n.strip() and n.strip() not in watched]
+        with self.lock, self.conn:
+            before = self.conn.total_changes
+            self.conn.executemany("INSERT OR IGNORE INTO pending(name, added_at) VALUES (?,?)",
+                                  [(n, now_iso()) for n in fresh])
+            return self.conn.total_changes - before
+
+    def next_pending(self, max_tries: int = 3) -> dict | None:
+        row = self.conn.execute("SELECT * FROM pending WHERE tries < ? ORDER BY tries, added_at "
+                                "LIMIT 1", (max_tries,)).fetchone()
+        return dict(row) if row else None
+
+    def pending_list(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM pending ORDER BY tries, added_at")]
+
+    def resolve_pending(self, name: str, goods_id: int) -> None:
+        self.add_watch(goods_id, name)
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM pending WHERE name = ?", (name,))
+
+    def fail_pending(self, name: str, error: str) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("UPDATE pending SET tries = tries + 1, error = ? WHERE name = ?",
+                              (error, name))
+
+    def remove_pending(self, name: str | None = None) -> None:
+        """One name, or (None) every name that has given up."""
+        with self.lock, self.conn:
+            if name is None:
+                self.conn.execute("DELETE FROM pending WHERE tries >= 3")
+            else:
+                self.conn.execute("DELETE FROM pending WHERE name = ?", (name,))
 
     # -- listings -------------------------------------------------------------
 

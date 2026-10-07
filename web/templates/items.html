@@ -2,14 +2,50 @@
 {% block body %}
 <h1>Предметы</h1>
 <div class="card">
+  <h2>Подобрать из базы бота</h2>
+  <form method="get" action="{{ url_for('items') }}">
+    <input type="hidden" name="pick" value="1">
+    <div class="grid">
+      <div><label for="min_rate">Продаж в сутки, от</label>
+        <input id="min_rate" type="number" step="any" name="min_rate" value="{{ pick.min_rate }}"></div>
+      <div><label for="min_price">Цена, от $</label>
+        <input id="min_price" type="number" step="any" name="min_price" value="{{ pick.min_price }}"></div>
+      <div><label for="limit">Сколько</label>
+        <input id="limit" type="number" name="limit" value="{{ pick.limit }}"></div>
+    </div>
+    <div class="help">Ходовые предметы по продажам CSFloat за 30 дней. Уже добавленные и паттерновые
+      скины не предлагаются. «Премия float» — насколько самая дорогая сотая дороже самой дешёвой.</div>
+    <div class="row"><button class="ghost">Показать</button></div>
+  </form>
+  {% if picked is not none %}
+    {% if not picked %}<p class="muted">Под условия ничего не подошло.</p>{% else %}
+    <div class="scroll"><table class="cards">
+      <tr><th>Предмет</th><th>Продаж в сутки</th><th>Медиана</th><th>Премия float</th></tr>
+      {% for c in picked %}
+      <tr><td class="title">{{ c.name }}</td>
+        <td data-label="Продаж в сутки">{{ '%.1f'|format(c.rate) }}</td>
+        <td data-label="Медиана">${{ '%.2f'|format(c.median) }}</td>
+        <td data-label="Премия float">{{ ((c.premium * 100)|round|int ~ '%') if c.premium is not none else '—' }}</td></tr>
+      {% endfor %}
+    </table></div>
+    <form method="post" action="{{ url_for('items_queue') }}">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <textarea name="names" hidden>{{ picked|map(attribute='name')|join('\n') }}</textarea>
+      <div class="row"><button>Добавить все {{ picked|length }}</button>
+        <span class="muted">goods_id сервис найдёт сам</span></div>
+    </form>
+    {% endif %}
+  {% endif %}
+</div>
+
+<div class="card">
   <h2>Добавить</h2>
   <form method="post" action="{{ url_for('items_add') }}">
     <input type="hidden" name="csrf" value="{{ csrf }}">
-    <label for="lines">По строке: <code>goods_id</code> или <code>goods_id;название как в CSFloat-боте</code></label>
-    <textarea id="lines" name="lines" placeholder="5777&#10;24322;M4A4 | Temukau (Field-Tested)"></textarea>
-    <div class="help">goods_id виден в запросе <code>sell_order</code> на странице предмета (DevTools → Network).
-      Без названия оно берётся с BuffMarket (до 10 за раз). Предмет должен быть в базе CSFloat-бота:
-      по его продажам считается рынок. Для фаз Doppler впишите название с фазой.</div>
+    <label for="lines">По строке: название как в CSFloat-боте, <code>goods_id</code> или <code>goods_id;название</code></label>
+    <textarea id="lines" name="lines" placeholder="AK-47 | Redline (Field-Tested)&#10;5777&#10;24322;M4A4 | Temukau (Field-Tested)"></textarea>
+    <div class="help">По названию goods_id сервис найдёт сам. Предмет должен быть в базе CSFloat-бота:
+      по его продажам считается рынок. Для фаз Doppler — название с фазой.</div>
     <div class="row"><button>Добавить</button></div>
   </form>
   {% if names %}
@@ -18,6 +54,25 @@
 {% endfor %}</pre></details>
   {% endif %}
 </div>
+
+{% if pending %}
+<div class="card">
+  <h2>Ищу goods_id ({{ pending|length }})</h2>
+  <div class="scroll"><table class="cards">
+    <tr><th>Предмет</th><th>Состояние</th><th></th></tr>
+    {% for p in pending %}
+    <tr><td class="title">{{ p.name }}</td>
+      <td data-label="Состояние" class="{{ 'err' if p.tries >= 3 }}">{% if p.tries == 0 %}в очереди{% elif p.tries < 3 %}попытка {{ p.tries }}: {{ p.error }}{% else %}не найден: {{ p.error }}{% endif %}</td>
+      <td class="actions"><form method="post" action="{{ url_for('pending_remove') }}" class="inline">
+        <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="name" value="{{ p.name }}">
+        <button class="danger small">×</button></form></td></tr>
+    {% endfor %}
+  </table></div>
+  <form method="post" action="{{ url_for('pending_remove') }}" class="row">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost small">Убрать ненайденные</button>
+  </form>
+</div>
+{% endif %}
 
 <div class="card">
   <h2>Опрашиваются</h2>

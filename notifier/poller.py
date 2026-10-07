@@ -24,7 +24,7 @@ from pathlib import Path
 
 import requests
 
-from . import buff, config, sales
+from . import buff, config, phases, sales
 from .buff import BuffError, LoginRequired
 from .judge import HISTORY_DAYS, Market, judge, message
 from .listings import item_url, parse_page
@@ -36,6 +36,7 @@ log = logging.getLogger("buff.poller")
 RATE_DAYS = 30.0
 BACKOFF_429 = 15 * 60
 IDLE = 30.0
+SEARCH_EVERY = 4
 
 
 def _hash(text: str) -> str:
@@ -58,6 +59,7 @@ class Poller:
         self._client, self._client_key = None, None
         self._db, self._db_path = None, None
         self._pruned: datetime | None = None
+        self._polls_in_a_row = 0
 
     # -- helpers --------------------------------------------------------------
 
@@ -119,12 +121,20 @@ class Poller:
             return 60.0
 
         item = self.store.next_due(now)
+        pending = self.store.next_pending()
+        # Searches go when no item is due, and every fifth request even when
+        # polling never pauses, so a long queue still drains.
+        if pending and (item is None or self._polls_in_a_row >= SEARCH_EVERY):
+            self._polls_in_a_row = 0
+            self.store.set_status("state", "работает: ищу goods_id")
+            return self.resolve(pending, s, sec, tg, now, cookie)
         if item is None:
             self.store.set_status("state", "работает")
             soon = self.store.soonest()
             return IDLE if soon is None else max(1.0, min(IDLE, (soon - now).total_seconds()))
 
         self.prune(now)
+        self._polls_in_a_row += 1
         return self.poll(item, s, sec, db, tg, now, cookie)
 
     def poll(self, item: dict, s: dict, sec: dict, db, tg: Telegram, now: datetime,
@@ -133,23 +143,10 @@ class Poller:
         try:
             body = self.client(s, sec).sell_orders(gid, page_size=s["page_size"])
         except LoginRequired:
-            log.warning("BuffMarket: сессия истекла")
-            self.store.set_status("session", "истекла")
-            self.store.set_status("session_expired", cookie)
-            self.alert_once(tg, "session_alerted", cookie,
-                            "⚠️ BuffMarket: сессия истекла, опрос остановлен.\n"
-                            "Обновите сессию на странице «Настройки» веб-панели.")
+            self.session_expired(tg, cookie)
             return 0.0
         except BuffError as e:
-            if e.status == 429:
-                wait = e.retry_after or BACKOFF_429
-                until = now_iso(now + timedelta(seconds=wait))
-                self.store.set_status("pause_until", until)
-                self.store.set_status("last_429", until)
-                log.warning("BuffMarket: 429, пауза %ds", wait)
-                self.alert_once(tg, "alerted_429", now.strftime("%Y-%m-%d"),
-                                f"⚠️ BuffMarket ограничивает запросы (429), пауза до {until[11:16]} UTC.\n"
-                                "Если повторяется — сократите список или увеличьте паузу.")
+            self.maybe_429(e, tg, now)
             self.store.polled(gid, now, s["poll_min_minutes"], None, str(e))
             return 0.0
         except requests.RequestException as e:
@@ -198,6 +195,56 @@ class Poller:
                                               "возможен пропуск — опрос чаще")
         log.info("%s: лотов %d, новых %d, сигналов %d, следующий опрос через %.0f мин",
                  name, len(ids), len(new), sent, minutes)
+        return 0.0
+
+    def session_expired(self, tg: Telegram, cookie: str) -> None:
+        log.warning("BuffMarket: сессия истекла")
+        self.store.set_status("session", "истекла")
+        self.store.set_status("session_expired", cookie)
+        self.alert_once(tg, "session_alerted", cookie,
+                        "⚠️ BuffMarket: сессия истекла, опрос остановлен.\n"
+                        "Обновите сессию на странице «Настройки» веб-панели.")
+
+    def maybe_429(self, e: BuffError, tg: Telegram, now: datetime) -> None:
+        if e.status != 429:
+            return
+        wait = e.retry_after or BACKOFF_429
+        until = now_iso(now + timedelta(seconds=wait))
+        self.store.set_status("pause_until", until)
+        self.store.set_status("last_429", until)
+        log.warning("BuffMarket: 429, пауза %ds", wait)
+        self.alert_once(tg, "alerted_429", now.strftime("%Y-%m-%d"),
+                        f"⚠️ BuffMarket ограничивает запросы (429), пауза до {until[11:16]} UTC.\n"
+                        "Если повторяется — сократите список или увеличьте паузу.")
+
+    def resolve(self, p: dict, s: dict, sec: dict, tg: Telegram, now: datetime,
+                cookie: str) -> float:
+        """Find one queued name's goods_id with the market's search. A Doppler
+        phase is searched by its base name: BuffMarket sells all phases as one
+        item and the listings carry the paint index."""
+        name = p["name"]
+        base = phases.split(name)[0]
+        try:
+            body = self.client(s, sec).search_goods(base)
+        except LoginRequired:
+            self.session_expired(tg, cookie)
+            return 0.0
+        except BuffError as e:
+            self.maybe_429(e, tg, now)
+            self.store.fail_pending(name, str(e))
+            return 0.0
+        except requests.RequestException as e:
+            self.store.fail_pending(name, f"сеть: {e}")
+            return 0.0
+        self.store.set_status("session", "работает")
+        gid = buff.match_goods(body, base)
+        if gid is None:
+            found = len((body.get("data") or {}).get("items") or [])
+            self.store.fail_pending(name, f"не найден на BuffMarket (результатов поиска: {found})")
+            log.info("%s: goods_id не найден", name)
+        else:
+            self.store.resolve_pending(name, gid)
+            log.info("%s: goods_id %d, добавлен в опрос", name, gid)
         return 0.0
 
     def prune(self, now: datetime) -> None:
