@@ -13,6 +13,7 @@ back to the page - only their last characters.
 from __future__ import annotations
 
 import hmac
+import hashlib
 import ipaddress
 import logging
 import secrets as pysecrets
@@ -23,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
-from flask import (Flask, abort, flash, redirect, render_template, request, session,
+from flask import (Flask, Response, abort, flash, jsonify, redirect, render_template, request, session,
                    url_for)
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
@@ -31,6 +32,7 @@ from werkzeug.security import check_password_hash
 from notifier import buff, candidates, config, sales
 from notifier.buff import BuffError, LoginRequired
 from notifier.accounts import Accounts, profile_key, route_keys, SESSION_KEYS
+from notifier.browser_login import BrowserLogins
 from notifier.envfile import write_env
 from notifier.listings import item_url
 from notifier.poller import daily_load
@@ -48,7 +50,8 @@ TEST_GOODS_ID = 5777          # Desert Eagle | Mecha Industries (MW): any item w
 
 def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = config.SETTINGS_PATH,
                env_path: Path = config.ENV_PATH, client_factory=buff.from_config,
-               telegram_factory=Telegram, http_get=requests.get, accounts_path: Path | None = None) -> Flask:
+               telegram_factory=Telegram, http_get=requests.get, accounts_path: Path | None = None,
+               login_factory=BrowserLogins) -> Flask:
     app = Flask(__name__)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
@@ -61,6 +64,8 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
                       PERMANENT_SESSION_LIFETIME=timedelta(days=30))
     store = Store(store_path)
     accounts = Accounts(accounts_path or Path(store_path).parent / "accounts.json", env_path)
+    logins = login_factory(accounts, store_path, settings_path, client_factory=client_factory, http_get=http_get)
+    app.extensions["browser_logins"] = logins
     fails: dict[str, list[float]] = {}
 
     def settings() -> dict:
@@ -121,6 +126,10 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
 
     @app.route("/logout", methods=["POST"])
     def logout():
+        owner = hashlib.sha256(session.get("csrf", "").encode()).hexdigest()
+        for job in list(logins.jobs.values()):
+            if job.owner == owner:
+                job.stop.set()
         session.clear()
         return redirect(url_for("login"))
 
@@ -276,6 +285,70 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
             if route:
                 store.release_route(route, owner)
         return redirect(url_for("accounts_page"))
+
+    # -- items ------------------------------------------------------------------
+
+    def browser_owner():
+        return hashlib.sha256(session.get("csrf", "").encode()).hexdigest()
+
+    def browser_job(jid):
+        job = logins.get(jid, browser_owner())
+        if job is None:
+            abort(404)
+        return job
+
+    def start_browser(aid):
+        try:
+            job = logins.start(aid, browser_owner(), request.form.get("username", "").strip(), request.form.get("password", ""))
+            return redirect(url_for("accounts_browser", jid=job.id))
+        except ValueError as e:
+            flash(str(e), "error")
+            return redirect(url_for("accounts_page"))
+
+    @app.route("/accounts/<aid>/login/start", methods=["POST"])
+    def accounts_login_start(aid):
+        return start_browser(aid)
+
+    @app.route("/accounts/login/new", methods=["POST"])
+    def accounts_login_new():
+        try:
+            raw = request.form.get("interval", "").strip()
+            interval = float(raw.replace(",", ".")) if raw else None
+            aid = accounts.save(None, request.form.get("label", ""), proxy=request.form.get("proxy", ""), interval=interval)
+        except ValueError as e:
+            flash(str(e) if "could not convert" not in str(e) else "Пауза должна быть числом.", "error")
+            return redirect(url_for("accounts_page"))
+        return start_browser(aid)
+
+    @app.route("/accounts/login/<jid>")
+    def accounts_browser(jid):
+        response = app.make_response(render_template("browser_login.html", job=browser_job(jid).public()))
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
+        return response
+
+    @app.route("/accounts/login/<jid>/status")
+    def accounts_browser_status(jid):
+        response = jsonify(browser_job(jid).public())
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/accounts/login/<jid>/image")
+    def accounts_browser_image(jid):
+        job = browser_job(jid)
+        with job.lock:
+            data = job.image
+        return Response(data or b"", status=200 if data else 204, mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+    @app.route("/accounts/login/<jid>/action", methods=["POST"])
+    def accounts_browser_action(jid):
+        try:
+            browser_job(jid).action(request.form.get("kind"), request.form)
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        return jsonify(ok=True)
 
     # -- items ------------------------------------------------------------------
 

@@ -33,6 +33,7 @@ h2 { font-size: 16px; margin: 0 0 10px; }
 .flash.ok { background: var(--ok-bg); color: var(--ok); }
 .flash.error { background: var(--err-bg); color: var(--err); }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
+[hidden] { display: none !important; }
 th, td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 500; font-size: 13px; }
 .scroll { overflow-x: auto; }

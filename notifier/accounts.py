@@ -165,6 +165,31 @@ class Accounts:
             a.update(egress_ip=ip, tested_key=expected_key)
             self._write(profiles)
 
+    def receive_session(self, aid: str, expected_key: str, values: dict, ip: str) -> None:
+        """Commit a validated browser session only if the profile wasn't edited/deleted."""
+        ip = str(ipaddress.ip_address(ip))
+        changes = {k: values[k] for k in SESSION_KEYS if k != "BUFF_PROXY" and k in values}
+        if not changes.get("BUFF_COOKIE"):
+            raise ValueError("Браузер не передал сессию BuffMarket.")
+        with LOCK:
+            live = next((a for a in self.list() if a["id"] == aid), None)
+            if not live or profile_key(live) != expected_key:
+                raise ValueError("Настройки аккаунта изменились; начните вход заново.")
+            if any(a["id"] != aid and a["BUFF_COOKIE"] == changes["BUFF_COOKIE"] for a in self.list()):
+                raise ValueError("Эта сессия уже используется другим профилем.")
+            updated = dict(live, **changes)
+            profiles = self._read()
+            a = next((a for a in profiles if a["id"] == aid), None)
+            if a is None:
+                a = {k: live[k] for k in ("id", "label", "enabled", "interval")}
+                profiles.insert(0, a)
+            if aid == "primary":
+                write_env(self.env_path, changes)
+            else:
+                a.update(changes)
+            a.update(egress_ip=ip, tested_key=profile_key(updated))
+            self._write(profiles)
+
     def toggle(self, aid: str) -> None:
         with LOCK:
             live = next((a for a in self.list() if a["id"] == aid), None)

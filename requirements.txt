@@ -4,4 +4,5 @@ brotli>=1.1           # urllib3 объявит br, ответ меньше
 python-dotenv>=1.0
 Flask>=3.0
 waitress>=3.0         # веб-сервер панели
+playwright>=1.63,<2   # отдельный Chromium для входа через Steam
 pytest>=8             # только для тестов

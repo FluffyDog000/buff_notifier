@@ -274,6 +274,19 @@ journalctl -u caddy -n 50 --no-pager
 
 ## Обновление кода
 
+Для функции входа в Steam нужен Chromium. После установки requirements:
+
+```bash
+.venv/bin/python -m playwright install --with-deps chromium
+```
+
+Сессии дополнительных аккаунтов хранятся в `data/accounts.json` (600),
+авторизация браузеров — в `data/browser_profiles` (700). При переносе
+сервера сохраните эти приватные файлы вместе с `.env`; в Git они не входят.
+Панель запускает один браузер входа одновременно и закрывает его по
+таймауту/отмене/перезапуску службы. При обновлении Playwright установите
+соответствующий Chromium указанной командой.
+
 ```bash
 cd /root/buff_notifier && git pull && .venv/bin/pip install -r requirements.txt
 ```

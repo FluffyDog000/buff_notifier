@@ -1,0 +1,83 @@
+{% extends "base.html" %}{% block title %}Вход через Steam{% endblock %}
+{% block body %}
+<h1>Вход через Steam · {{ job.label }}</h1>
+<div class="card">
+  <p id="login-state">{{ job.state }}</p>
+  <div class="muted">Страница браузера: <strong id="login-host">{{ job.host or 'загрузка…' }}</strong></div>
+  <p class="help">После входа сессия BuffMarket сохранится и проверится автоматически. Если потребуется действие, нажми нужное место в окне ниже. Подтверждение Steam Guard или капча выполняются в этом же браузере.</p>
+  <p class="help">На время открытого окна опрос с этого IP приостанавливается. Остальные адреса продолжают работать.</p>
+  <div class="row" id="browser-actions">
+    <button class="ghost" data-action="check">Проверить и сохранить сессию</button>
+    <button class="ghost" data-action="buff">Вернуться в BuffMarket</button>
+    <button class="danger" data-action="cancel">Отменить вход</button>
+  </div>
+  <div class="row"><a href="{{ url_for('accounts_page') }}">К аккаунтам</a></div>
+  <p id="action-error" class="fielderr"></p>
+</div>
+<div class="card" id="browser-screen">
+  <img id="login-image" alt="Окно входа Steam / BuffMarket" style="width:100%;max-width:1100px;display:none;cursor:pointer;border-radius:8px" draggable="false">
+  <div class="row">
+    <input id="browser-text" type="password" autocomplete="new-password" placeholder="Нажми поле в окне, затем введи текст здесь" style="flex:1;min-width:180px" maxlength="1024">
+    <button id="send-text" class="ghost">Ввести в выбранное поле</button>
+  </div>
+  <div class="row">
+    <button class="ghost" data-key="Tab">Tab</button><button class="ghost" data-key="Enter">Enter</button>
+    <button class="ghost" data-key="Control+A">Выделить всё</button><button class="ghost" data-key="Backspace">Удалить</button>
+    <button class="ghost" data-action="scroll">Прокрутить вниз</button>
+  </div>
+</div>
+<script>
+(() => {
+  const prefix = {{ url_for('accounts_browser', jid=job.id)|tojson }}, csrf = {{ csrf|tojson }};
+  const state = document.getElementById('login-state'), host = document.getElementById('login-host');
+  const picture = document.getElementById('login-image'), error = document.getElementById('action-error');
+  let finished = false, imageUrl = null;
+  async function action(kind, values = {}) {
+    if (finished) return;
+    try {
+      const response = await fetch(prefix + '/action', {method:'POST', credentials:'same-origin',
+        headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:new URLSearchParams({csrf,kind,...values})});
+      const answer = await response.json();
+      error.textContent = answer.error || '';
+    } catch (_) { error.textContent = 'Не удалось отправить действие. Обнови страницу.'; }
+  }
+  document.querySelectorAll('[data-action]').forEach(b => b.onclick = () => action(b.dataset.action));
+  document.querySelectorAll('[data-key]').forEach(b => b.onclick = () => action('key',{key:b.dataset.key}));
+  picture.onclick = e => {
+    const box = picture.getBoundingClientRect();
+    action('click',{x:String((e.clientX-box.left)*{{ job.width }}/box.width),y:String((e.clientY-box.top)*{{ job.height }}/box.height)});
+  };
+  function sendText() {
+    const field = document.getElementById('browser-text'), text = field.value;
+    field.value = '';
+    if (text) action('text',{text});
+  }
+  document.getElementById('send-text').onclick = sendText;
+  document.getElementById('browser-text').onkeydown = e => { if(e.key === 'Enter'){e.preventDefault();sendText();} };
+  async function refresh() {
+    try {
+      const response = await fetch(prefix+'/status',{cache:'no-store',credentials:'same-origin'});
+      if (!response.ok || response.redirected) throw Error();
+      const data = await response.json();
+      state.textContent = data.state; host.textContent = data.host || 'загрузка…'; finished = data.done;
+      if (finished) {
+        document.getElementById('browser-screen').hidden = true;
+        document.getElementById('browser-actions').hidden = true;
+        if(imageUrl) URL.revokeObjectURL(imageUrl);
+        return;
+      }
+      if(data.has_image){
+        const imageResponse = await fetch(prefix+'/image',{cache:'no-store',credentials:'same-origin'});
+        if(imageResponse.status === 200){
+          const next = URL.createObjectURL(await imageResponse.blob());
+          if(imageUrl) URL.revokeObjectURL(imageUrl);
+          imageUrl = next; picture.src = next; picture.style.display = 'block';
+        }
+      }
+    } catch (_) { error.textContent = 'Связь с окном входа прервалась. Обнови страницу.'; }
+    setTimeout(refresh,1200);
+  }
+  refresh();
+})();
+</script>
+{% endblock %}

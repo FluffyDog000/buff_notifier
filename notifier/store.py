@@ -240,6 +240,12 @@ class Store:
             key = self._route_key(key)
             self.conn.execute("UPDATE routes SET owner=NULL,busy_until=NULL WHERE key=? AND owner=?", (key, owner))
 
+    def space_route(self, key: str, owner: str, interval: float, now: datetime) -> None:
+        """Keep the normal delay after a manual request made under a route lease."""
+        with self.lock, self.conn:
+            self.conn.execute("UPDATE routes SET next_at=MAX(COALESCE(next_at,''),?) WHERE key=? AND owner=?",
+                              ((now + timedelta(seconds=interval)).isoformat(), self._route_key(key), owner))
+
     def pause_route(self, key: str, until: str) -> None:
         with self.lock, self.conn:
             key = self._route_key(key)
