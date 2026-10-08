@@ -212,6 +212,7 @@ def test_browser_web_routes_enforce_csrf_ownership_and_secret_free_status(app):
     (False, "steam_denied_403"), (False, "steam_denied_200"),
     (False, "submit_timeout"), (False, "field_timeout"),
     (False, "signed_out_once"), (False, "signed_out_persistent"),
+    (False, "signed_out_cached"),
 ])
 def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, navigation_interrupt, registration_case):
     """Actual browser fills/submits the form, receives cookies, validates and saves.
@@ -229,6 +230,7 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
     registration_complete = []
     transient_timeouts = []
     returns_to_signin = []
+    confirmed = []
     needs_registration = registration_case in ('retry', '429', 'persistent')
     monkeypatch.setattr(browser_login, 'REGISTRATION_RETRY_SECONDS', .2)
     monkeypatch.setattr(browser_login, 'LOGIN_RETURN_GRACE_SECONDS', .2)
@@ -278,9 +280,14 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
                             route.fulfill(status=status, content_type='text/html', body=body)
                         elif '/blocked-resource' in route.request.url:
                             route.fulfill(status=403,body='Forbidden')
+                        elif '/confirm' in route.request.url:
+                            confirmed.append(True)
+                            route.fulfill(content_type='text/html', body="<script>location.href='https://api.buff.market/callback'</script>")
                         elif '/submit' in route.request.url:
                             submitted.append(route.request.post_data)
                             route.fulfill(content_type='text/html', body="<script>location.href='https://api.buff.market/callback'</script>")
+                        elif registration_case == 'signed_out_cached' and submitted:
+                            route.fulfill(content_type='text/html', body='<form method="post" action="/confirm"><input type="submit" value="Sign In"></form>')
                         else:
                             route.fulfill(content_type='text/html', body='''<form method="post" action="/submit">
                             <input name="username" type="text"><input name="password" type="password">
@@ -302,7 +309,7 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
                         else:
                             ctx.add_cookies([dict(name='session',value='TESTBROWSER',domain='.buff.market',path='/',secure=True),
                                              dict(name='csrf_token',value='CSRF',domain='.buff.market',path='/',secure=True)])
-                            signed_out = registration_case == 'signed_out_persistent' or (registration_case == 'signed_out_once' and len(submitted) == 1)
+                            signed_out = registration_case == 'signed_out_persistent' or (registration_case == 'signed_out_once' and len(submitted) == 1) or (registration_case == 'signed_out_cached' and not confirmed)
                             if signed_out:
                                 returns_to_signin.append(True)
                             destination='register' if needs_registration else ('signed-out' if signed_out else 'finish')
@@ -364,7 +371,8 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
     class Client:
         def sell_orders(self, *args, **kwargs):
             if returns_to_signin and (registration_case == 'signed_out_persistent' or len(submitted) == 1):
-                raise LoginRequired('Returned to sign-in')
+                if not confirmed:
+                    raise LoginRequired('Returned to sign-in')
             if needs_registration and not registration_complete:
                 raise LoginRequired('Registration pending')
             return {'code':'OK'}
@@ -401,6 +409,8 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
             count = 3 if registration_case == 'signed_out_persistent' else (2 if registration_case == 'signed_out_once' else 1)
             assert submitted == ['username=TESTUSER&password=TESTPASSWORD'] * count
         assert job.credentials is None and job.image is None
+        if registration_case == 'signed_out_cached':
+            assert confirmed == [True]
         if registration_case in ('submit_timeout', 'field_timeout'):
             assert transient_timeouts == [True]
             assert 'SECRET' not in str(job.public()) and 'TESTPASSWORD' not in str(job.public())

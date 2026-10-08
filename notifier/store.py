@@ -14,6 +14,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from .listings import signal_key
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS watch (
@@ -38,6 +39,7 @@ CREATE INDEX IF NOT EXISTS idx_seen_time ON seen(first_seen);
 CREATE TABLE IF NOT EXISTS signals (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     listing_id    TEXT UNIQUE NOT NULL,
+    dedup_key     TEXT,
     goods_id      INTEGER NOT NULL,
     name          TEXT NOT NULL,
     kind          TEXT NOT NULL,             -- cheap | float
@@ -124,6 +126,19 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         self.lock = threading.Lock()
+        # Preserve the history of already sent duplicates; only their earliest
+        # row claims the common identity. The unique index is shared by workers.
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            if "dedup_key" not in {r[1] for r in self.conn.execute("PRAGMA table_info(signals)")}:
+                self.conn.execute("ALTER TABLE signals ADD COLUMN dedup_key TEXT")
+            self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_identity ON signals(dedup_key)")
+            if not self.conn.execute("SELECT 1 FROM status WHERE key='signal_identity_migrated'").fetchone():
+                rows = self.conn.execute("SELECT id, listing_id, goods_id, float_value, paint_seed FROM signals ORDER BY id").fetchall()
+                for row in rows:
+                    key = signal_key(row["listing_id"], row["goods_id"], row["float_value"], row["paint_seed"])
+                    self.conn.execute("UPDATE OR IGNORE signals SET dedup_key=? WHERE id=?", (key, row["id"]))
+                self.conn.execute("INSERT INTO status(key,value,at) VALUES ('signal_identity_migrated','1',?)", (now_iso(),))
         if "search_page" not in {r[1] for r in self.conn.execute("PRAGMA table_info(pending)")}:
             try:
                 self.conn.execute("ALTER TABLE pending ADD COLUMN search_page INTEGER NOT NULL DEFAULT 1")
@@ -401,8 +416,9 @@ class Store:
 
     def add_signal(self, sig: dict) -> int | None:
         """Row id, or None when this listing already had its one alert."""
-        cols = ("listing_id", "goods_id", "name", "kind", "price_usd", "float_value",
+        cols = ("listing_id", "dedup_key", "goods_id", "name", "kind", "price_usd", "float_value",
                 "paint_seed", "expected", "profit", "profit_pct", "basis", "text", "created_at")
+        sig = dict(sig, dedup_key=signal_key(sig["listing_id"], sig["goods_id"], sig.get("float_value"), sig.get("paint_seed")))
         with self.lock, self.conn:
             cur = self.conn.execute(
                 f"INSERT OR IGNORE INTO signals({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",

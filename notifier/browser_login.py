@@ -516,6 +516,7 @@ class BrowserLogins:
                                 raise ValueError("Steam отказал в доступе через этот прокси (Access Denied). "
                                                  "Вход не завершён. Проверьте доступ к Steam через этот прокси.")
                             returned = True
+                            submitted_form = False
                             if job.credentials:
                                 username, password = job.credentials
                                 name_field = page.locator('input[type="text"]').first
@@ -526,13 +527,18 @@ class BrowserLogins:
                                     job.credentials = None
                                     del username, password
                                     submit_at = now
+                                    submitted_form = True
                                     step = "steam_submit"
                                     page.locator('button[type="submit"]').first.click(no_wait_after=True)
                                     job.update(state="Данные отправлены в Steam. Ожидаю завершения входа…")
-                            elif now - submit_at > 3:
+                            if not submitted_form and now - submit_at > 3:
                                 step = "steam_confirmation"
                                 confirmation = page.locator('#imageLogin')
-                                if confirmation.count() and confirmation.is_visible():
+                                password_field = page.locator('input[type="password"]').first
+                                password_visible = password_field.count() and password_field.is_visible()
+                                if not confirmation.count() and not password_visible:
+                                    confirmation = page.get_by_role("button", name=re.compile(r"^Sign in$", re.I)).first
+                                if not password_visible and confirmation.count() and confirmation.is_visible():
                                     submit_at = now
                                     confirmation.click(no_wait_after=True)
                                     job.update(state="Подтверждаю вход в BuffMarket…")

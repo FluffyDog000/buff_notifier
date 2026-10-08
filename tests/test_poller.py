@@ -90,6 +90,66 @@ def test_a_cheap_listing_is_alerted_once(env):
     assert env[0].recent_signals()[0]["sent"] == 1
 
 
+def test_remote_listing_with_changing_suffix_is_alerted_once_across_restarts(env):
+    first = lot(190, 80, 0.161)
+    first['id'] = '1094400227-18DF-136074490'
+    second = dict(first, id='1094400227-18DF-137407458')
+    p = poller(env, Client(page(first)))
+    p.cycle(NOW)
+    # A different worker/process has a separate SQLite connection and sees a
+    # different full ID, but must claim the same notification identity.
+    other = Store(env[0].conn.execute('PRAGMA database_list').fetchone()[2])
+    try:
+        poller((other, env[1], env[2]), Client(page(second))).cycle(NOW + timedelta(seconds=5))
+        assert len(TG.sent) == 1 and len(other.recent_signals()) == 1
+    finally:
+        other.conn.close()
+
+
+def test_different_remote_skins_with_same_item_price_and_float_are_not_suppressed(env):
+    first = lot(190, 80, 0.161)
+    first['id'] = '1094400227-18DF-136074490'
+    different = dict(first, id='1094400228-18DF-136074490')
+    poller(env, Client(page(first, different))).cycle(NOW)
+    assert len(TG.sent) == 2
+
+
+def test_legacy_remote_signals_are_migrated_without_deleting_history(tmp_path):
+    from notifier.store import SCHEMA
+    path = tmp_path / 'legacy.db'
+    c = sqlite3.connect(path)
+    c.executescript(SCHEMA.replace('    dedup_key     TEXT,\n', ''))
+    for suffix in ('136074490', '137407458'):
+        c.execute('INSERT INTO signals(listing_id,goods_id,name,kind,float_value,paint_seed,created_at,sent) VALUES (?,?,?,?,?,?,?,1)',
+                  ('1094400227-18DF-' + suffix, 35637, NAME, 'float', 0.007013104856014252, 190, NOW.isoformat()))
+    c.commit(); c.close()
+    migrated = Store(path)
+    try:
+        result = migrated.add_signal(dict(listing_id='1094400227-18DF-138124430', goods_id=35637, name=NAME, kind='float', float_value=0.007013104856014252, paint_seed=190, created_at=NOW.isoformat()))
+        assert result is None and len(migrated.recent_signals()) == 2
+        assert all(row['sent'] == 1 for row in migrated.recent_signals())
+    finally:
+        migrated.conn.close()
+
+
+def test_concurrent_remote_alerts_claim_one_identity(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    path = tmp_path / 'parallel.db'
+    Store(path).conn.close()
+    barrier = Barrier(2)
+    def insert(suffix):
+        store = Store(path)
+        try:
+            barrier.wait(timeout=5)
+            return store.add_signal(dict(listing_id='1094400227-18DF-' + suffix, goods_id=35637, name=NAME, kind='float', float_value=0.007013104856014252, paint_seed=190, created_at=NOW.isoformat()))
+        finally:
+            store.conn.close()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(insert, ('136074490', '137407458')))
+    assert sum(result is not None for result in results) == 1
+
+
 def test_vanilla_search_continues_to_exact_match_on_later_page(env):
     store, s_path, envp = env
     store.add_pending(['★ Survival Knife'])

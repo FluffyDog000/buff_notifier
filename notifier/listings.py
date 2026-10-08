@@ -22,11 +22,25 @@ confirmed from the answer itself.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+import re
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 SITE = "https://buff.market"
 LISTED = 1
+
+
+def signal_key(listing_id: str, goods_id: int, float_value, paint_seed) -> str:
+    """Remote order IDs append a changing request/account suffix to the lot ID.
+
+    Keep the original ID for history. Float/seed and goods scope the stable
+    portion so that other physical skins of the same item remain distinct.
+    """
+    remote = re.fullmatch(r"(\d+-[0-9A-Fa-f]+)-\d+", listing_id)
+    if remote:
+        return json.dumps(["remote", goods_id, remote[1], float_value, paint_seed], separators=(",", ":"))
+    return "listing:" + listing_id
 
 
 @dataclass
