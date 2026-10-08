@@ -210,6 +210,7 @@ def test_browser_web_routes_enforce_csrf_ownership_and_secret_free_status(app):
     (False, "none"), (True, "none"), (False, "retry"), (True, "retry"),
     (False, "429"), (False, "persistent"),
     (False, "steam_denied_403"), (False, "steam_denied_200"),
+    (False, "submit_timeout"), (False, "field_timeout"),
 ])
 def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, navigation_interrupt, registration_case):
     """Actual browser fills/submits the form, receives cookies, validates and saves.
@@ -225,6 +226,8 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
     submitted = []
     registration_requests, unrelated_next = [], []
     registration_complete = []
+    transient_timeouts = []
+    needs_registration = registration_case in ('retry', '429', 'persistent')
     monkeypatch.setattr(browser_login, 'REGISTRATION_RETRY_SECONDS', .2)
     if registration_case == 'persistent':
         monkeypatch.setattr(browser_login, 'LIFETIME', 15)
@@ -235,6 +238,34 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
             launch = pw.chromium.launch_persistent_context
             def patched(directory, **kwargs):
                 ctx = launch(directory, **kwargs)
+                if registration_case in ('submit_timeout', 'field_timeout'):
+                    def patch_page(page):
+                        original_locator = page.locator
+                        class TransientLocator:
+                            def __init__(self, locator):
+                                self.locator = locator.first
+                            @property
+                            def first(self):
+                                return self
+                            def count(self):
+                                return self.locator.count()
+                            def is_visible(self):
+                                return self.locator.is_visible()
+                            def fill(self, value):
+                                if not transient_timeouts:
+                                    transient_timeouts.append(True)
+                                    raise sync_api.TimeoutError('Temporary field timeout http://private:SECRET@host:80')
+                                self.locator.fill(value)
+                            def click(self, **kw):
+                                self.locator.click(**kw)
+                                if not transient_timeouts:
+                                    transient_timeouts.append(True)
+                                    raise sync_api.TimeoutError('Waiting for scheduled navigations to finish http://private:SECRET@host:80')
+                        selected = 'button[type="submit"]' if registration_case == 'submit_timeout' else 'input[type="password"]'
+                        page.locator = lambda selector, **kw: TransientLocator(original_locator(selector, **kw)) if selector == selected else original_locator(selector, **kw)
+                    ctx.on('page', patch_page)
+                    for page in ctx.pages:
+                        patch_page(page)
                 def serve(route):
                     host = route.request.url.split('/')[2]
                     if host == 'steamcommunity.com':
@@ -268,11 +299,11 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
                         else:
                             ctx.add_cookies([dict(name='session',value='TESTBROWSER',domain='.buff.market',path='/',secure=True),
                                              dict(name='csrf_token',value='CSRF',domain='.buff.market',path='/',secure=True)])
-                            destination='finish' if registration_case == 'none' else 'register'
+                            destination='register' if needs_registration else 'finish'
                             route.fulfill(content_type='text/html', body=f"<script>location.href='https://buff.market/{destination}'</script>")
                     elif host == 'buff.market':
                         if '/finish' in route.request.url:
-                            route.fulfill(content_type='text/html',body='<script>window.close()</script>')
+                            route.fulfill(content_type='text/html',body='<h1>BuffMarket</h1>' if registration_case == 'submit_timeout' else '<script>window.close()</script>')
                         elif '/register' in route.request.url:
                             route.fulfill(content_type='text/html',body='''
                             <button onclick="fetch('https://api.buff.market/wrong-next')">Next</button>
@@ -305,8 +336,8 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
                             return self.locator.count()
                         def is_visible(self):
                             return self.locator.first.is_visible()
-                        def click(self):
-                            self.locator.first.click()
+                        def click(self, **kw):
+                            self.locator.first.click(**kw)
                             if not interrupted:
                                 interrupted.append(True)
                                 raise sync_api.Error("Execution context was destroyed, most likely because of a navigation")
@@ -319,7 +350,7 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
     monkeypatch.setattr(sync_api, 'sync_playwright', Wrapped)
     class Client:
         def sell_orders(self, *args, **kwargs):
-            if registration_case != 'none' and not registration_complete:
+            if needs_registration and not registration_complete:
                 raise LoginRequired('Registration pending')
             return {'code':'OK'}
     def client_factory(s, sec):
@@ -349,5 +380,8 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
         if not registration_case.startswith('steam_denied'):
             assert submitted == ['username=TESTUSER&password=TESTPASSWORD']
         assert job.credentials is None and job.image is None
+        if registration_case in ('submit_timeout', 'field_timeout'):
+            assert transient_timeouts == [True]
+            assert 'SECRET' not in str(job.public()) and 'TESTPASSWORD' not in str(job.public())
     finally:
         mgr.close()

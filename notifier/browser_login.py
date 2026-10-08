@@ -404,9 +404,10 @@ class BrowserLogins:
 
     def _run(self, job, a):
         context, store, route, owner = None, None, None, None
+        step = "prepare"
         try:
             store = Store(self.store_path)
-            from playwright.sync_api import Error as BrowserError, sync_playwright
+            from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeout, sync_playwright
             ip, route, owner, interval = self._prepare_route(job, a, store)
             parent = self.accounts.path.parent / "browser_profiles" / a["id"] / hashlib.sha256(a["BUFF_PROXY"].encode()).hexdigest()[:16]
             identity = hashlib.sha256(job.credentials[0].lower().encode()).hexdigest()[:32] if job.credentials else "manual"
@@ -419,6 +420,7 @@ class BrowserLogins:
             for private in (parent.parent.parent, parent.parent, parent, directory):
                 os.chmod(private, 0o700)
             with sync_playwright() as p:
+                step = "launch_browser"
                 context = p.chromium.launch_persistent_context(str(directory), headless=True,
                     viewport={"width": WIDTH, "height": HEIGHT}, locale="en-US", proxy=browser_proxy(a["BUFF_PROXY"]),
                     accept_downloads=False, args=["--disable-save-password-bubble"])
@@ -463,6 +465,7 @@ class BrowserLogins:
                 page = context.pages[0] if context.pages else context.new_page()
                 for old in context.pages[1:]:
                     old.close()
+                step = "open_buff"
                 page.goto("https://buff.market/", wait_until="domcontentloaded")
                 headers["user-agent"] = page.evaluate("navigator.userAgent")
                 signin_at, submit_at, probe_at, renewed_at, returned = 0, 0, 0, 0, False
@@ -489,6 +492,7 @@ class BrowserLogins:
                         if not allowed_page(page.url):
                             job.update(state="Ожидаю загрузку страницы Steam или BuffMarket…")
                         elif host in STEAM_HOSTS:
+                            step = "steam_form"
                             denied = page.get_by_role("heading", name="Access Denied", exact=True)
                             if denied.count() and denied.first.is_visible():
                                 raise ValueError("Steam отказал в доступе через этот прокси (Access Denied). "
@@ -504,15 +508,18 @@ class BrowserLogins:
                                     job.credentials = None
                                     del username, password
                                     submit_at = now
-                                    page.locator('button[type="submit"]').first.click()
+                                    step = "steam_submit"
+                                    page.locator('button[type="submit"]').first.click(no_wait_after=True)
                                     job.update(state="Данные отправлены в Steam. Ожидаю завершения входа…")
                             elif now - submit_at > 3:
+                                step = "steam_confirmation"
                                 confirmation = page.locator('#imageLogin')
                                 if confirmation.count() and confirmation.is_visible():
                                     submit_at = now
-                                    confirmation.click()
+                                    confirmation.click(no_wait_after=True)
                                     job.update(state="Подтверждаю вход в BuffMarket…")
                         elif host == "buff.market" or host.endswith(".buff.market"):
+                            step = "buff_registration"
                             pending, next_button = registration_form(page)
                             if pending:
                                 returned = True
@@ -524,13 +531,14 @@ class BrowserLogins:
                                     # Registration may finish without changing the session cookie.
                                     attempted_cookies.clear()
                                     job.update(state=f"Подтверждаю Registration: Next, попытка {registration['attempts']} из {REGISTRATION_MAX_ATTEMPTS}…")
-                                    next_button.click()
+                                    next_button.click(no_wait_after=True)
                             cookies = context.cookies([buff.API])
                             cookie_key = hashlib.sha256(str(cookies).encode()).hexdigest()
                             has_session = any("session" in c["name"].lower() for c in cookies)
                             if not pending and host in ("buff.market", "www.buff.market") and (returned or has_session) and cookie_key not in attempted_cookies and now - probe_at >= max(5, interval):
                                 attempted_cookies.add(cookie_key)
                                 probe_at = now
+                                step = "validate_session"
                                 if self._save(job, a, store, context, page, headers, ip, route, interval):
                                     (parent / "last_profile").write_text(identity, encoding="ascii")
                                     os.chmod(parent / "last_profile", 0o600)
@@ -540,14 +548,17 @@ class BrowserLogins:
                                 signin = page.get_by_text("Sign in", exact=True)
                                 signin_at = now
                                 if steam.count() and steam.first.is_visible():
-                                    steam.first.click()
+                                    step = "open_steam"
+                                    steam.first.click(no_wait_after=True)
                                 elif signin.count() and signin.first.is_visible():
+                                    step = "open_signin"
                                     signin.first.click()
                         try:
                             action = job.actions.get_nowait()
                         except queue.Empty:
                             action = None
                         if action and allowed_page(page.url):
+                            step = "manual_action"
                             if action[0] == "click":
                                 page.mouse.click(action[1], action[2])
                             elif action[0] == "key":
@@ -568,6 +579,7 @@ class BrowserLogins:
                             action = None
                         if page.is_closed():
                             continue
+                        step = "screenshot"
                         try:
                             job.update(image=page.screenshot(type="jpeg", quality=75, timeout=5000))
                             page.wait_for_timeout(750)
@@ -585,6 +597,14 @@ class BrowserLogins:
                         if page.is_closed() or "Execution context was destroyed" in message or "Cannot find context with specified id" in message:
                             job.stop.wait(.1)
                             continue
+                        if isinstance(error, BrowserTimeout):
+                            # A slow transition or a temporarily disappearing field is
+                            # not a failed login. Submitted credentials stay cleared.
+                            # The overall lifetime and cancel button still bound the wait.
+                            log.info("Ожидание браузерного входа аккаунта %s: timeout; step=%s", a["id"], step)
+                            job.update(state="Страница отвечает дольше обычного. Продолжаю ожидать завершения входа…")
+                            job.stop.wait(.25)
+                            continue
                         raise
                 else:
                     job.update(state="Вход отменён." if job.stop.is_set() else "Окно закрыто по таймауту. Начните вход заново.")
@@ -593,8 +613,9 @@ class BrowserLogins:
         except ValueError as e:
             job.update(state=str(e))
         except Exception as e:
-            log.warning("Ошибка браузерного входа аккаунта %s: %s", a["id"], type(e).__name__)
-            job.update(state="Не удалось завершить вход. Проверьте прокси или повторите попытку.")
+            log.warning("Ошибка браузерного входа аккаунта %s: %s; step=%s", a["id"], type(e).__name__, step)
+            job.update(state="Не удалось дождаться загрузки страницы. Повторите вход." if type(e).__name__ == "TimeoutError" else
+                       "Не удалось завершить вход. Проверьте прокси или повторите попытку.")
         finally:
             if context is not None:
                 try:
