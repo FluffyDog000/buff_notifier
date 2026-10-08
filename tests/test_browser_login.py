@@ -206,8 +206,11 @@ def test_browser_web_routes_enforce_csrf_ownership_and_secret_free_status(app):
 
 
 @pytest.mark.skipif(os.environ.get("BUFF_TEST_BROWSER") != "1", reason="Requires installed Chromium")
-@pytest.mark.parametrize("navigation_interrupt", [False, True])
-def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, navigation_interrupt):
+@pytest.mark.parametrize("navigation_interrupt,registration_case", [
+    (False, "none"), (True, "none"), (False, "retry"), (True, "retry"),
+    (False, "429"), (False, "persistent"),
+])
+def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, navigation_interrupt, registration_case):
     """Actual browser fills/submits the form, receives cookies, validates and saves.
 
     Every HTTP request is intercepted; no test credentials reach Steam/Buff.
@@ -219,6 +222,11 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
     monkeypatch.setattr(browser_login.log, 'warning', lambda *args, **kw: diagnostics.append(traceback.format_exc()))
     actual = sync_api.sync_playwright
     submitted = []
+    registration_requests, unrelated_next = [], []
+    registration_complete = []
+    monkeypatch.setattr(browser_login, 'REGISTRATION_RETRY_SECONDS', .2)
+    if registration_case == 'persistent':
+        monkeypatch.setattr(browser_login, 'LIFETIME', 15)
     class Wrapped:
         def __enter__(self):
             self.real = actual()
@@ -237,14 +245,41 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
                             <input name="username" type="text"><input name="password" type="password">
                             <button type="submit">Sign in</button></form>''')
                     elif host == 'api.buff.market':
-                        ctx.add_cookies([dict(name='session',value='TESTBROWSER',domain='.buff.market',path='/',secure=True),
-                                         dict(name='csrf_token',value='CSRF',domain='.buff.market',path='/',secure=True)])
-                        route.fulfill(content_type='text/html', body="<script>location.href='https://buff.market/finish'</script>")
+                        if '/wrong-next' in route.request.url:
+                            unrelated_next.append(True)
+                            route.fulfill(body='{}')
+                        elif '/registration/next' in route.request.url:
+                            registration_requests.append(True)
+                            cors = {'Access-Control-Allow-Origin':'https://buff.market'}
+                            if registration_case == '429':
+                                route.fulfill(status=429,headers={**cors,'Retry-After':'120'},body='{}')
+                            elif registration_case == 'persistent' or len(registration_requests) == 1:
+                                route.fulfill(status=503,headers=cors,body='{}')
+                            else:
+                                registration_complete.append(True)
+                                route.fulfill(headers=cors,body='{}')
+                        else:
+                            ctx.add_cookies([dict(name='session',value='TESTBROWSER',domain='.buff.market',path='/',secure=True),
+                                             dict(name='csrf_token',value='CSRF',domain='.buff.market',path='/',secure=True)])
+                            destination='finish' if registration_case == 'none' else 'register'
+                            route.fulfill(content_type='text/html', body=f"<script>location.href='https://buff.market/{destination}'</script>")
                     elif host == 'buff.market':
                         if '/finish' in route.request.url:
                             route.fulfill(content_type='text/html',body='<script>window.close()</script>')
+                        elif '/register' in route.request.url:
+                            route.fulfill(content_type='text/html',body='''
+                            <button onclick="fetch('https://api.buff.market/wrong-next')">Next</button>
+                            <div hidden><h2>Registration</h2><button>Next</button></div>
+                            <div><h2>Registration</h2><p>TESTUSER</p><p id="error"></p>
+                            <button disabled id="next" onclick="this.disabled=true;
+                              fetch('https://api.buff.market/registration/next',{method:'POST'})
+                              .then(r=>{if(r.ok)location.href='https://buff.market/finish';
+                              else {document.querySelector('#error').textContent='Temporary error';this.disabled=false;}})">Next</button>
+                            </div><script>setTimeout(()=>document.querySelector('#next').disabled=false,250)</script>''')
                         else:
                             route.fulfill(content_type='text/html',body='''<button onclick="document.querySelector('#steam').hidden=false">Sign in</button>
+                            <button onclick="fetch('https://api.buff.market/wrong-next')">Next</button>
+                            <div hidden><h2>Registration</h2><button>Next</button></div>
                             <div id="steam" hidden onclick="window.open('https://steamcommunity.com/openid/loginform/')">Steam</div>''')
                     else:
                         route.abort()
@@ -277,6 +312,8 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
     monkeypatch.setattr(sync_api, 'sync_playwright', Wrapped)
     class Client:
         def sell_orders(self, *args, **kwargs):
+            if registration_case != 'none' and not registration_complete:
+                raise LoginRequired('Registration pending')
             return {'code':'OK'}
     def client_factory(s, sec):
         assert sec['BUFF_COOKIE'] == 'session=TESTBROWSER; csrf_token=CSRF'
@@ -286,9 +323,17 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
     try:
         job.thread.join(timeout=35)
         assert job.done, job.public()
-        assert job.state.startswith('Готово'), job.state + '\n' + '\n'.join(diagnostics)
+        if registration_case in ('429', 'persistent'):
+            assert not job.success and read_env(env[2])['BUFF_COOKIE'] == 'session=1'
+            assert len(registration_requests) == (1 if registration_case == '429' else 3)
+            if registration_case == '429':
+                assert '429' in job.state and env[0].route_pause('ip:1.2.3.4')
+        else:
+            assert job.state.startswith('Готово'), job.state + '\n' + '\n'.join(diagnostics)
+            assert read_env(env[2])['BUFF_COOKIE'] == 'session=TESTBROWSER; csrf_token=CSRF'
+            assert len(registration_requests) == (2 if registration_case == 'retry' else 0)
+        assert not unrelated_next
         assert submitted == ['username=TESTUSER&password=TESTPASSWORD']
-        assert read_env(env[2])['BUFF_COOKIE'] == 'session=TESTBROWSER; csrf_token=CSRF'
         assert job.credentials is None and job.image is None
     finally:
         mgr.close()

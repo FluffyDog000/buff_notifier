@@ -30,6 +30,8 @@ from .store import Store
 log = logging.getLogger("buff.login")
 WIDTH, HEIGHT = 1100, 760
 LIFETIME = 600
+REGISTRATION_RETRY_SECONDS = 5
+REGISTRATION_MAX_ATTEMPTS = 3
 STEAM_HOSTS = {"steamcommunity.com", "login.steampowered.com", "store.steampowered.com"}
 KEYS = {"Enter", "Tab", "Shift+Tab", "Backspace", "Delete", "Escape", "Control+A",
         "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space"}
@@ -53,6 +55,20 @@ def browser_proxy(url: str) -> dict | None:
     if u.username is not None:
         out.update(username=unquote(u.username), password=unquote(u.password or ""))
     return out
+
+
+def registration_form(page):
+    """Find Next only inside the visible Buff Registration form, never pagination."""
+    for heading in page.get_by_text("Registration", exact=True).all():
+        if not heading.is_visible():
+            continue
+        container = heading.locator("xpath=ancestor::*[.//*[normalize-space(text())='Next']][1]")
+        if container.count():
+            for button in container.get_by_text("Next", exact=True).all():
+                if button.is_visible() and button.is_enabled() and button.get_attribute("aria-disabled") != "true":
+                    return True, button
+        return True, None
+    return False, None
 
 
 class Job:
@@ -421,9 +437,16 @@ class BrowserLogins:
                     r.fallback()
                 context.route("**/*", restrict)
                 headers = {}
+                registration = {"attempts": 0, "at": 0, "limited": False}
                 def observe(response):
                     try:
                         u = urlsplit(response.url)
+                        if registration["attempts"] and response.status == 429 and (u.hostname == "buff.market" or (u.hostname or "").endswith(".buff.market")):
+                            registration["limited"] = True
+                            delay = buff.retry_after_seconds(response.headers.get("retry-after"))
+                            until = (datetime.now(timezone.utc) + timedelta(seconds=delay if delay is not None else 900)).isoformat()
+                            store.pause_route(route, until)
+                            store.set_status(f"account:{a['id']}:pause_until", until)
                         if u.hostname == "api.buff.market" and u.path == buff.SELL_ORDER:
                             headers.update(response.request.all_headers())
                     except Exception:  # response may disappear as a login popup closes
@@ -445,6 +468,8 @@ class BrowserLogins:
                             break
                         page = pages[-1]
                         now = time.monotonic()
+                        if registration["limited"]:
+                            raise ValueError("BuffMarket ограничил подтверждение регистрации (HTTP 429). Повторите вход после окончания паузы.")
                         host = urlsplit(page.url).hostname or ""
                         job.update(host=host)
                         if now - renewed_at > 30:
@@ -473,10 +498,22 @@ class BrowserLogins:
                                     confirmation.click()
                                     job.update(state="Подтверждаю вход в BuffMarket…")
                         elif host == "buff.market" or host.endswith(".buff.market"):
+                            pending, next_button = registration_form(page)
+                            if pending:
+                                returned = True
+                                if registration["attempts"] >= REGISTRATION_MAX_ATTEMPTS:
+                                    job.update(state="Форма Registration осталась после 3 попыток. Можно нажать Next вручную в этом окне.")
+                                elif next_button is not None and now - registration["at"] >= REGISTRATION_RETRY_SECONDS:
+                                    registration["attempts"] += 1
+                                    registration["at"] = now
+                                    # Registration may finish without changing the session cookie.
+                                    attempted_cookies.clear()
+                                    job.update(state=f"Подтверждаю Registration: Next, попытка {registration['attempts']} из {REGISTRATION_MAX_ATTEMPTS}…")
+                                    next_button.click()
                             cookies = context.cookies([buff.API])
                             cookie_key = hashlib.sha256(str(cookies).encode()).hexdigest()
                             has_session = any("session" in c["name"].lower() for c in cookies)
-                            if (returned or has_session) and cookie_key not in attempted_cookies and now - probe_at >= max(5, interval):
+                            if not pending and host in ("buff.market", "www.buff.market") and (returned or has_session) and cookie_key not in attempted_cookies and now - probe_at >= max(5, interval):
                                 attempted_cookies.add(cookie_key)
                                 probe_at = now
                                 if self._save(job, a, store, context, page, headers, ip, route, interval):
