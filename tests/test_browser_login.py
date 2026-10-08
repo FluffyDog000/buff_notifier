@@ -209,6 +209,7 @@ def test_browser_web_routes_enforce_csrf_ownership_and_secret_free_status(app):
 @pytest.mark.parametrize("navigation_interrupt,registration_case", [
     (False, "none"), (True, "none"), (False, "retry"), (True, "retry"),
     (False, "429"), (False, "persistent"),
+    (False, "steam_denied_403"), (False, "steam_denied_200"),
 ])
 def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, navigation_interrupt, registration_case):
     """Actual browser fills/submits the form, receives cookies, validates and saves.
@@ -237,13 +238,19 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
                 def serve(route):
                     host = route.request.url.split('/')[2]
                     if host == 'steamcommunity.com':
-                        if '/submit' in route.request.url:
+                        if registration_case.startswith('steam_denied'):
+                            status = 403 if registration_case.endswith('403') else 200
+                            body = 'Forbidden' if status == 403 else '<h1>Access Denied</h1><p>You don\'t have permission to access this server.</p>'
+                            route.fulfill(status=status, content_type='text/html', body=body)
+                        elif '/blocked-resource' in route.request.url:
+                            route.fulfill(status=403,body='Forbidden')
+                        elif '/submit' in route.request.url:
                             submitted.append(route.request.post_data)
                             route.fulfill(content_type='text/html', body="<script>location.href='https://api.buff.market/callback'</script>")
                         else:
                             route.fulfill(content_type='text/html', body='''<form method="post" action="/submit">
                             <input name="username" type="text"><input name="password" type="password">
-                            <button type="submit">Sign in</button></form>''')
+                            <button type="submit">Sign in</button></form><script>fetch('/blocked-resource')</script>''')
                     elif host == 'api.buff.market':
                         if '/wrong-next' in route.request.url:
                             unrelated_next.append(True)
@@ -322,8 +329,14 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
     job = mgr.start('primary','owner','TESTUSER','TESTPASSWORD')
     try:
         job.thread.join(timeout=35)
-        assert job.done, job.public()
-        if registration_case in ('429', 'persistent'):
+        assert job.done, str(job.public())
+        if registration_case.startswith('steam_denied'):
+            assert not job.success and read_env(env[2])['BUFF_COOKIE'] == 'session=1'
+            assert 'Steam' in job.state and 'Access Denied' in job.state, job.state + '\n' + '\n'.join(diagnostics)
+            assert not submitted and not registration_requests
+            assert not env[0].route_pause('ip:1.2.3.4')
+            assert 'TESTPASSWORD' not in str(job.public())
+        elif registration_case in ('429', 'persistent'):
             assert not job.success and read_env(env[2])['BUFF_COOKIE'] == 'session=1'
             assert len(registration_requests) == (1 if registration_case == '429' else 3)
             if registration_case == '429':
@@ -333,7 +346,8 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
             assert read_env(env[2])['BUFF_COOKIE'] == 'session=TESTBROWSER; csrf_token=CSRF'
             assert len(registration_requests) == (2 if registration_case == 'retry' else 0)
         assert not unrelated_next
-        assert submitted == ['username=TESTUSER&password=TESTPASSWORD']
+        if not registration_case.startswith('steam_denied'):
+            assert submitted == ['username=TESTUSER&password=TESTPASSWORD']
         assert job.credentials is None and job.image is None
     finally:
         mgr.close()

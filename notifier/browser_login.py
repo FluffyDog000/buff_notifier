@@ -437,10 +437,18 @@ class BrowserLogins:
                     r.fallback()
                 context.route("**/*", restrict)
                 headers = {}
+                steam_access = {"denied": False}
                 registration = {"attempts": 0, "at": 0, "limited": False}
                 def observe(response):
                     try:
                         u = urlsplit(response.url)
+                        if u.hostname in STEAM_HOSTS and response.status == 403 and response.request.is_navigation_request():
+                            try:
+                                main = response.frame.parent_frame is None
+                            except BrowserError:  # popup navigation can precede its frame
+                                main = True
+                            if main:
+                                steam_access["denied"] = True
                         if registration["attempts"] and response.status == 429 and (u.hostname == "buff.market" or (u.hostname or "").endswith(".buff.market")):
                             registration["limited"] = True
                             delay = buff.retry_after_seconds(response.headers.get("retry-after"))
@@ -470,6 +478,9 @@ class BrowserLogins:
                         now = time.monotonic()
                         if registration["limited"]:
                             raise ValueError("BuffMarket ограничил подтверждение регистрации (HTTP 429). Повторите вход после окончания паузы.")
+                        if steam_access["denied"]:
+                            raise ValueError("Steam отказал в доступе через этот прокси (HTTP 403, Access Denied). "
+                                             "Вход не завершён. Проверьте доступ к Steam через этот прокси.")
                         host = urlsplit(page.url).hostname or ""
                         job.update(host=host)
                         if now - renewed_at > 30:
@@ -478,6 +489,10 @@ class BrowserLogins:
                         if not allowed_page(page.url):
                             job.update(state="Ожидаю загрузку страницы Steam или BuffMarket…")
                         elif host in STEAM_HOSTS:
+                            denied = page.get_by_role("heading", name="Access Denied", exact=True)
+                            if denied.count() and denied.first.is_visible():
+                                raise ValueError("Steam отказал в доступе через этот прокси (Access Denied). "
+                                                 "Вход не завершён. Проверьте доступ к Steam через этот прокси.")
                             returned = True
                             if job.credentials:
                                 username, password = job.credentials
