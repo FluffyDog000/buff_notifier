@@ -294,11 +294,10 @@ class BrowserLogins:
         profiles = self.accounts.list()
         primary = profiles[0]
         if proxy and not primary["BUFF_PROXY"] and not primary.get("egress_ip"):
-            direct = str(ipaddress.ip_address(self.http_get("https://api.ipify.org?format=json", timeout=15, proxies={}).json()["ip"]))
+            direct = self._egress_ip(job, "")
             self.accounts.tested("primary", profile_key(primary), direct)
             store.link_routes("direct", "ip:" + direct)
-        ip = str(ipaddress.ip_address(self.http_get("https://api.ipify.org?format=json", timeout=15,
-                        proxies={"http": proxy, "https": proxy} if proxy else {}).json()["ip"]))
+        ip = self._egress_ip(job, proxy)
         route = "ip:" + ip
         store.link_routes(route_keys([{k: v for k, v in a.items() if k != "egress_ip"}])[a["id"]], route)
         settings = config.load_settings(self.settings_path)
@@ -320,6 +319,36 @@ class BrowserLogins:
             if job.stop.wait(0.25):
                 raise ValueError("Вход отменён.")
         raise ValueError("Этот IP сейчас занят. Повторите вход чуть позже.")
+
+    def _egress_ip(self, job, proxy):
+        """A transient proxy tunnel failure must not discard a queued login immediately."""
+        for attempt in range(3):
+            if job.stop.is_set():
+                raise ValueError("Вход отменён.")
+            job.update(state="Проверяю соединение и исходящий IP…" if not attempt else
+                       f"Повторяю проверку соединения: попытка {attempt + 1} из 3…")
+            try:
+                response = self.http_get("https://api.ipify.org?format=json", timeout=15,
+                                        proxies={"http": proxy, "https": proxy} if proxy else {})
+                status = getattr(response, "status_code", 200)
+                if status != 200:
+                    if status == 407:
+                        raise ValueError("Прокси отклонил авторизацию (HTTP 407). Проверьте его логин и пароль.")
+                    raise ValueError(f"Проверка исходящего IP вернула HTTP {status}. Вход ещё не начат.")
+                try:
+                    return str(ipaddress.ip_address(response.json()["ip"]))
+                except (ValueError, KeyError, TypeError):
+                    raise ValueError("Не удалось определить исходящий IP. Вход ещё не начат.") from None
+            except requests.RequestException as error:
+                # Never expose requests/Playwright exception text: it can contain
+                # the complete authenticated proxy URL. Inspect only fixed codes.
+                if "Tunnel connection failed: 407" in str(error):
+                    raise ValueError("Прокси отклонил авторизацию (HTTP 407). Проверьте его логин и пароль.") from None
+                if attempt == 2:
+                    raise ValueError("Не удалось соединиться для проверки IP после 3 попыток. "
+                                     "Проверьте доступ прокси с сервера и повторите вход.") from None
+                if job.stop.wait(attempt + 1):
+                    raise ValueError("Вход отменён.") from None
 
     def _save(self, job, a, store, context, page, headers, ip, route, interval=None):
         cookies = context.cookies([buff.API])
@@ -361,7 +390,7 @@ class BrowserLogins:
         context, store, route, owner = None, None, None, None
         try:
             store = Store(self.store_path)
-            from playwright.sync_api import sync_playwright
+            from playwright.sync_api import Error as BrowserError, sync_playwright
             ip, route, owner, interval = self._prepare_route(job, a, store)
             parent = self.accounts.path.parent / "browser_profiles" / a["id"] / hashlib.sha256(a["BUFF_PROXY"].encode()).hexdigest()[:16]
             identity = hashlib.sha256(job.credentials[0].lower().encode()).hexdigest()[:32] if job.credentials else "manual"
@@ -409,88 +438,100 @@ class BrowserLogins:
                 attempted_cookies = set()
                 job.update(state="Открыт BuffMarket. Запускаю вход через Steam…")
                 while not job.stop.is_set() and time.monotonic() - job.created < LIFETIME:
-                    pages = [x for x in context.pages if not x.is_closed()]
-                    if not pages:
-                        job.update(state="Окно браузера закрыто. Начните вход заново.")
-                        break
-                    page = pages[-1]
-                    now = time.monotonic()
-                    host = urlsplit(page.url).hostname or ""
-                    job.update(host=host)
-                    if now - renewed_at > 30:
-                        store.renew_claims(owner, datetime.now(timezone.utc))
-                        renewed_at = now
-                    if not allowed_page(page.url):
-                        job.update(state="Ожидаю загрузку страницы Steam или BuffMarket…")
-                    elif host in STEAM_HOSTS:
-                        returned = True
-                        if job.credentials:
-                            username, password = job.credentials
-                            name_field = page.locator('input[type="text"]').first
-                            password_field = page.locator('input[type="password"]').first
-                            if name_field.count() and password_field.count() and name_field.is_visible() and password_field.is_visible():
-                                name_field.fill(username)
-                                password_field.fill(password)
-                                job.credentials = None
-                                del username, password
-                                page.locator('button[type="submit"]').first.click()
-                                job.update(state="Данные отправлены в Steam. Ожидаю завершения входа…")
-                                submit_at = now
-                        elif now - submit_at > 3:
-                            confirmation = page.locator('#imageLogin')
-                            if confirmation.count() and confirmation.is_visible():
-                                confirmation.click()
-                                submit_at = now
-                                job.update(state="Подтверждаю вход в BuffMarket…")
-                    elif host == "buff.market" or host.endswith(".buff.market"):
-                        cookies = context.cookies([buff.API])
-                        cookie_key = hashlib.sha256(str(cookies).encode()).hexdigest()
-                        has_session = any("session" in c["name"].lower() for c in cookies)
-                        if (returned or has_session) and cookie_key not in attempted_cookies and now - probe_at >= max(5, interval):
-                            attempted_cookies.add(cookie_key)
-                            probe_at = now
-                            if self._save(job, a, store, context, page, headers, ip, route, interval):
-                                (parent / "last_profile").write_text(identity, encoding="ascii")
-                                os.chmod(parent / "last_profile", 0o600)
-                                break
-                        if not returned and now - signin_at > 5:
-                            steam = page.get_by_text("Steam", exact=True)
-                            signin = page.get_by_text("Sign in", exact=True)
-                            if steam.count() and steam.first.is_visible():
-                                steam.first.click()
-                            elif signin.count() and signin.first.is_visible():
-                                signin.first.click()
-                            signin_at = now
                     try:
-                        action = job.actions.get_nowait()
-                    except queue.Empty:
-                        action = None
-                    if action and allowed_page(page.url):
-                        if action[0] == "click":
-                            page.mouse.click(action[1], action[2])
-                        elif action[0] == "key":
-                            page.keyboard.press(action[1])
-                        elif action[0] == "text":
-                            page.keyboard.insert_text(action[1])
-                        elif action[0] == "scroll":
-                            page.mouse.wheel(0, 450)
-                        elif action[0] == "buff":
-                            page.goto("https://buff.market/", wait_until="domcontentloaded")
+                        pages = [x for x in context.pages if not x.is_closed()]
+                        if not pages:
+                            job.update(state="Окно браузера закрыто. Начните вход заново.")
+                            break
+                        page = pages[-1]
+                        now = time.monotonic()
+                        host = urlsplit(page.url).hostname or ""
+                        job.update(host=host)
+                        if now - renewed_at > 30:
+                            store.renew_claims(owner, datetime.now(timezone.utc))
+                            renewed_at = now
+                        if not allowed_page(page.url):
+                            job.update(state="Ожидаю загрузку страницы Steam или BuffMarket…")
+                        elif host in STEAM_HOSTS:
                             returned = True
-                        elif action[0] == "check" and now - probe_at >= max(5, interval):
-                            probe_at = now
-                            if self._save(job, a, store, context, page, headers, ip, route, interval):
-                                (parent / "last_profile").write_text(identity, encoding="ascii")
-                                os.chmod(parent / "last_profile", 0o600)
-                                break
-                        action = None
-                    if page.is_closed():
-                        continue
-                    try:
-                        job.update(image=page.screenshot(type="jpeg", quality=75, timeout=5000))
-                        page.wait_for_timeout(750)
-                    except Exception:
+                            if job.credentials:
+                                username, password = job.credentials
+                                name_field = page.locator('input[type="text"]').first
+                                password_field = page.locator('input[type="password"]').first
+                                if name_field.count() and password_field.count() and name_field.is_visible() and password_field.is_visible():
+                                    name_field.fill(username)
+                                    password_field.fill(password)
+                                    job.credentials = None
+                                    del username, password
+                                    submit_at = now
+                                    page.locator('button[type="submit"]').first.click()
+                                    job.update(state="Данные отправлены в Steam. Ожидаю завершения входа…")
+                            elif now - submit_at > 3:
+                                confirmation = page.locator('#imageLogin')
+                                if confirmation.count() and confirmation.is_visible():
+                                    submit_at = now
+                                    confirmation.click()
+                                    job.update(state="Подтверждаю вход в BuffMarket…")
+                        elif host == "buff.market" or host.endswith(".buff.market"):
+                            cookies = context.cookies([buff.API])
+                            cookie_key = hashlib.sha256(str(cookies).encode()).hexdigest()
+                            has_session = any("session" in c["name"].lower() for c in cookies)
+                            if (returned or has_session) and cookie_key not in attempted_cookies and now - probe_at >= max(5, interval):
+                                attempted_cookies.add(cookie_key)
+                                probe_at = now
+                                if self._save(job, a, store, context, page, headers, ip, route, interval):
+                                    (parent / "last_profile").write_text(identity, encoding="ascii")
+                                    os.chmod(parent / "last_profile", 0o600)
+                                    break
+                            if not returned and now - signin_at > 5:
+                                steam = page.get_by_text("Steam", exact=True)
+                                signin = page.get_by_text("Sign in", exact=True)
+                                signin_at = now
+                                if steam.count() and steam.first.is_visible():
+                                    steam.first.click()
+                                elif signin.count() and signin.first.is_visible():
+                                    signin.first.click()
+                        try:
+                            action = job.actions.get_nowait()
+                        except queue.Empty:
+                            action = None
+                        if action and allowed_page(page.url):
+                            if action[0] == "click":
+                                page.mouse.click(action[1], action[2])
+                            elif action[0] == "key":
+                                page.keyboard.press(action[1])
+                            elif action[0] == "text":
+                                page.keyboard.insert_text(action[1])
+                            elif action[0] == "scroll":
+                                page.mouse.wheel(0, 450)
+                            elif action[0] == "buff":
+                                page.goto("https://buff.market/", wait_until="domcontentloaded")
+                                returned = True
+                            elif action[0] == "check" and now - probe_at >= max(5, interval):
+                                probe_at = now
+                                if self._save(job, a, store, context, page, headers, ip, route, interval):
+                                    (parent / "last_profile").write_text(identity, encoding="ascii")
+                                    os.chmod(parent / "last_profile", 0o600)
+                                    break
+                            action = None
                         if page.is_closed():
+                            continue
+                        try:
+                            job.update(image=page.screenshot(type="jpeg", quality=75, timeout=5000))
+                            page.wait_for_timeout(750)
+                        except BrowserError:
+                            # A popup can change/close while Chromium captures it.
+                            # The screenshot is optional; keep checking the session.
+                            job.update(image=None)
+                            job.stop.wait(.2)
+                            continue
+                    except BrowserError as error:
+                        # Steam's successful OpenID callback can close its popup
+                        # while a locator or screenshot is still being evaluated.
+                        # Continue on the surviving Buff page to save the session.
+                        message = str(error)
+                        if page.is_closed() or "Execution context was destroyed" in message or "Cannot find context with specified id" in message:
+                            job.stop.wait(.1)
                             continue
                         raise
                 else:

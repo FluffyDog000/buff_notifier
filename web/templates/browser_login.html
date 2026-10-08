@@ -73,6 +73,9 @@
           if(imageUrl) URL.revokeObjectURL(imageUrl);
           imageUrl = next; picture.src = next; picture.style.display = 'block';
         }
+      } else {
+        picture.style.display = 'none';
+        if(imageUrl){ URL.revokeObjectURL(imageUrl); imageUrl = null; }
       }
     } catch (_) { error.textContent = 'Связь с окном входа прервалась. Обнови страницу.'; }
     setTimeout(refresh,1200);

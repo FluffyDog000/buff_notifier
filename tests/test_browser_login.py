@@ -4,6 +4,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import requests
 
 from notifier.accounts import Accounts, profile_key
 from notifier.browser_login import BrowserLogins, Job, allowed_page, browser_proxy
@@ -118,6 +119,61 @@ def test_login_route_gate_honors_existing_cooldown(env):
         mgr._prepare_route(Job("primary", "Main", "owner", None), a, env[0])
 
 
+def test_proxy_ip_check_retries_transient_tunnel_failure_and_keeps_login(env, monkeypatch):
+    mgr = manager(env)
+    aid = mgr.accounts.save(None, "Proxy", proxy="http://private:SECRET@host:80", interval=5)
+    a = mgr.accounts.list()[1]
+    calls = []
+    def get(url, **kw):
+        calls.append(kw["proxies"])
+        if kw["proxies"] and sum(bool(c) for c in calls) < 3:
+            raise requests.exceptions.ProxyError("Temporary failure http://private:SECRET@host:80")
+        return type("R", (), {"json": lambda self: {"ip": "1.2.3.4"}})()
+    mgr.http_get = get
+    job = Job(aid, "Proxy", "owner", ("user", "STEAMPASSWORD"))
+    monkeypatch.setattr(job.stop, "wait", lambda seconds: False)
+    ip, route, owner, _ = mgr._prepare_route(job, a, env[0])
+    try:
+        assert ip == "1.2.3.4" and sum(bool(c) for c in calls) == 3
+        assert job.credentials == ("user", "STEAMPASSWORD")
+        assert "SECRET" not in str(job.public())
+    finally:
+        env[0].release_route(route, owner)
+
+
+@pytest.mark.parametrize("tunnel,status,attempts", [(True, 407, 1), (True, 502, 3), (False, 407, 1)])
+def test_proxy_probe_errors_are_specific_bounded_and_secret_free(env, monkeypatch, tunnel, status, attempts):
+    mgr = manager(env)
+    calls = []
+    def get(*args, **kw):
+        calls.append(kw)
+        if tunnel:
+            raise requests.exceptions.ProxyError(f"http://private:SECRET@host:80 Tunnel connection failed: {status}")
+        return type("R", (), {"status_code": status})()
+    mgr.http_get = get
+    job = Job("primary", "Main", "owner", None)
+    monkeypatch.setattr(job.stop, "wait", lambda seconds: False)
+    with pytest.raises(ValueError) as failure:
+        mgr._egress_ip(job, "http://private:SECRET@host:80")
+    assert len(calls) == attempts
+    assert "SECRET" not in str(failure.value) and "private" not in str(failure.value)
+    assert ("HTTP 407" if status == 407 else "3 попыток") in str(failure.value)
+
+
+def test_proxy_probe_cancel_stops_retry_and_never_opens_browser(env, monkeypatch):
+    mgr = manager(env)
+    calls = []
+    def get(*args, **kw):
+        calls.append(kw)
+        raise requests.exceptions.ProxyError("temporary")
+    mgr.http_get = get
+    job = Job("primary", "Main", "owner", None)
+    monkeypatch.setattr(job.stop, "wait", lambda seconds: True)
+    with pytest.raises(ValueError, match="отменён"):
+        mgr._egress_ip(job, "http://host:80")
+    assert len(calls) == 1
+
+
 def test_browser_web_routes_enforce_csrf_ownership_and_secret_free_status(app):
     def runner(job, a):
         job.update(host="steamcommunity.com", image=b"FAKEIMAGE")
@@ -150,12 +206,17 @@ def test_browser_web_routes_enforce_csrf_ownership_and_secret_free_status(app):
 
 
 @pytest.mark.skipif(os.environ.get("BUFF_TEST_BROWSER") != "1", reason="Requires installed Chromium")
-def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch):
+@pytest.mark.parametrize("navigation_interrupt", [False, True])
+def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, navigation_interrupt):
     """Actual browser fills/submits the form, receives cookies, validates and saves.
 
     Every HTTP request is intercepted; no test credentials reach Steam/Buff.
     """
     from playwright import sync_api
+    import traceback
+    from notifier import browser_login
+    diagnostics = []
+    monkeypatch.setattr(browser_login.log, 'warning', lambda *args, **kw: diagnostics.append(traceback.format_exc()))
     actual = sync_api.sync_playwright
     submitted = []
     class Wrapped:
@@ -188,6 +249,26 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch):
                     else:
                         route.abort()
                 ctx.route('**/*',serve)
+                if navigation_interrupt:
+                    main_page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                    original = main_page.get_by_text
+                    interrupted = []
+                    class RacingLocator:
+                        def __init__(self, locator):
+                            self.locator = locator
+                        @property
+                        def first(self):
+                            return self
+                        def count(self):
+                            return self.locator.count()
+                        def is_visible(self):
+                            return self.locator.first.is_visible()
+                        def click(self):
+                            self.locator.first.click()
+                            if not interrupted:
+                                interrupted.append(True)
+                                raise sync_api.Error("Execution context was destroyed, most likely because of a navigation")
+                    main_page.get_by_text = lambda text, **kw: RacingLocator(original(text, **kw)) if text == 'Steam' else original(text, **kw)
                 return ctx
             pw.chromium.launch_persistent_context = patched
             return pw
@@ -205,7 +286,7 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch):
     try:
         job.thread.join(timeout=35)
         assert job.done, job.public()
-        assert job.state.startswith('Готово'), job.state
+        assert job.state.startswith('Готово'), job.state + '\n' + '\n'.join(diagnostics)
         assert submitted == ['username=TESTUSER&password=TESTPASSWORD']
         assert read_env(env[2])['BUFF_COOKIE'] == 'session=TESTBROWSER; csrf_token=CSRF'
         assert job.credentials is None and job.image is None
