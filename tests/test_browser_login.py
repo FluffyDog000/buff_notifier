@@ -211,6 +211,7 @@ def test_browser_web_routes_enforce_csrf_ownership_and_secret_free_status(app):
     (False, "429"), (False, "persistent"),
     (False, "steam_denied_403"), (False, "steam_denied_200"),
     (False, "submit_timeout"), (False, "field_timeout"),
+    (False, "signed_out_once"), (False, "signed_out_persistent"),
 ])
 def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, navigation_interrupt, registration_case):
     """Actual browser fills/submits the form, receives cookies, validates and saves.
@@ -227,8 +228,10 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
     registration_requests, unrelated_next = [], []
     registration_complete = []
     transient_timeouts = []
+    returns_to_signin = []
     needs_registration = registration_case in ('retry', '429', 'persistent')
     monkeypatch.setattr(browser_login, 'REGISTRATION_RETRY_SECONDS', .2)
+    monkeypatch.setattr(browser_login, 'LOGIN_RETURN_GRACE_SECONDS', .2)
     if registration_case == 'persistent':
         monkeypatch.setattr(browser_login, 'LIFETIME', 15)
     class Wrapped:
@@ -299,10 +302,20 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
                         else:
                             ctx.add_cookies([dict(name='session',value='TESTBROWSER',domain='.buff.market',path='/',secure=True),
                                              dict(name='csrf_token',value='CSRF',domain='.buff.market',path='/',secure=True)])
-                            destination='register' if needs_registration else 'finish'
+                            signed_out = registration_case == 'signed_out_persistent' or (registration_case == 'signed_out_once' and len(submitted) == 1)
+                            if signed_out:
+                                returns_to_signin.append(True)
+                            destination='register' if needs_registration else ('signed-out' if signed_out else 'finish')
                             route.fulfill(content_type='text/html', body=f"<script>location.href='https://buff.market/{destination}'</script>")
                     elif host == 'buff.market':
-                        if '/finish' in route.request.url:
+                        if '/signed-out' in route.request.url:
+                            # The real site's Steam label can be hidden while its
+                            # SVG icon remains clickable, as in the reported screen.
+                            route.fulfill(content_type='text/html',body='''<h2>Sign in</h2>
+                              <div class="login-action-item-wrap is-steam" style="width:100px;height:100px;background:blue"
+                              onclick="window.open('https://steamcommunity.com/openid/loginform/')"><svg></svg></div>
+                              <div hidden>Steam</div>''')
+                        elif '/finish' in route.request.url:
                             route.fulfill(content_type='text/html',body='<h1>BuffMarket</h1>' if registration_case == 'submit_timeout' else '<script>window.close()</script>')
                         elif '/register' in route.request.url:
                             route.fulfill(content_type='text/html',body='''
@@ -350,6 +363,8 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
     monkeypatch.setattr(sync_api, 'sync_playwright', Wrapped)
     class Client:
         def sell_orders(self, *args, **kwargs):
+            if returns_to_signin and (registration_case == 'signed_out_persistent' or len(submitted) == 1):
+                raise LoginRequired('Returned to sign-in')
             if needs_registration and not registration_complete:
                 raise LoginRequired('Registration pending')
             return {'code':'OK'}
@@ -367,6 +382,11 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
             assert not submitted and not registration_requests
             assert not env[0].route_pause('ip:1.2.3.4')
             assert 'TESTPASSWORD' not in str(job.public())
+        elif registration_case == 'signed_out_persistent':
+            assert not job.success and read_env(env[2])['BUFF_COOKIE'] == 'session=1'
+            assert 'после 3 попыток' in job.state, job.state + '\n' + '\n'.join(diagnostics)
+            assert len(returns_to_signin) == 3
+            assert not env[0].route_pause('ip:1.2.3.4')
         elif registration_case in ('429', 'persistent'):
             assert not job.success and read_env(env[2])['BUFF_COOKIE'] == 'session=1'
             assert len(registration_requests) == (1 if registration_case == '429' else 3)
@@ -378,7 +398,8 @@ def test_real_chromium_login_flow_with_mocked_steam_and_buff(env, monkeypatch, n
             assert len(registration_requests) == (2 if registration_case == 'retry' else 0)
         assert not unrelated_next
         if not registration_case.startswith('steam_denied'):
-            assert submitted == ['username=TESTUSER&password=TESTPASSWORD']
+            count = 3 if registration_case == 'signed_out_persistent' else (2 if registration_case == 'signed_out_once' else 1)
+            assert submitted == ['username=TESTUSER&password=TESTPASSWORD'] * count
         assert job.credentials is None and job.image is None
         if registration_case in ('submit_timeout', 'field_timeout'):
             assert transient_timeouts == [True]

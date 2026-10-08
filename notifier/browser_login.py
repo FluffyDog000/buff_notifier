@@ -32,6 +32,8 @@ WIDTH, HEIGHT = 1100, 760
 LIFETIME = 600
 REGISTRATION_RETRY_SECONDS = 5
 REGISTRATION_MAX_ATTEMPTS = 3
+LOGIN_MAX_ATTEMPTS = 3
+LOGIN_RETURN_GRACE_SECONDS = 10
 STEAM_HOSTS = {"steamcommunity.com", "login.steampowered.com", "store.steampowered.com"}
 KEYS = {"Enter", "Tab", "Shift+Tab", "Backspace", "Delete", "Escape", "Control+A",
         "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space"}
@@ -69,6 +71,17 @@ def registration_form(page):
                     return True, button
         return True, None
     return False, None
+
+
+def steam_signin(page):
+    """The Steam label may be hidden; click the visible provider icon instead."""
+    for button in page.locator('.login-action-item-wrap.is-steam').all():
+        if button.is_visible():
+            return button
+    steam = page.get_by_text("Steam", exact=True)
+    if steam.count() and steam.first.is_visible():
+        return steam.first
+    return None
 
 
 class Job:
@@ -404,6 +417,9 @@ class BrowserLogins:
 
     def _run(self, job, a):
         context, store, route, owner = None, None, None, None
+        # Retained only in this worker's RAM until success/cancel/timeout. Reuse
+        # requires an explicit return to Buff's sign-in form, never a slow POST.
+        retry_credentials = job.credentials
         step = "prepare"
         try:
             store = Store(self.store_path)
@@ -469,6 +485,7 @@ class BrowserLogins:
                 page.goto("https://buff.market/", wait_until="domcontentloaded")
                 headers["user-agent"] = page.evaluate("navigator.userAgent")
                 signin_at, submit_at, probe_at, renewed_at, returned = 0, 0, 0, 0, False
+                login_attempts, buff_return_at = 0, None
                 attempted_cookies = set()
                 job.update(state="Открыт BuffMarket. Запускаю вход через Steam…")
                 while not job.stop.is_set() and time.monotonic() - job.created < LIFETIME:
@@ -492,6 +509,7 @@ class BrowserLogins:
                         if not allowed_page(page.url):
                             job.update(state="Ожидаю загрузку страницы Steam или BuffMarket…")
                         elif host in STEAM_HOSTS:
+                            buff_return_at = None
                             step = "steam_form"
                             denied = page.get_by_role("heading", name="Access Denied", exact=True)
                             if denied.count() and denied.first.is_visible():
@@ -519,6 +537,8 @@ class BrowserLogins:
                                     confirmation.click(no_wait_after=True)
                                     job.update(state="Подтверждаю вход в BuffMarket…")
                         elif host == "buff.market" or host.endswith(".buff.market"):
+                            if returned and buff_return_at is None:
+                                buff_return_at = now
                             step = "buff_registration"
                             pending, next_button = registration_form(page)
                             if pending:
@@ -543,13 +563,27 @@ class BrowserLogins:
                                     (parent / "last_profile").write_text(identity, encoding="ascii")
                                     os.chmod(parent / "last_profile", 0o600)
                                     break
-                            if not returned and now - signin_at > 5:
-                                steam = page.get_by_text("Steam", exact=True)
+                            steam = None if pending else steam_signin(page)
+                            signin = page.get_by_text("Sign in", exact=True)
+                            signed_out = steam is not None or (signin.count() and signin.first.is_visible())
+                            if not pending and returned and signed_out and buff_return_at is not None and now - buff_return_at >= LOGIN_RETURN_GRACE_SECONDS:
+                                if login_attempts >= LOGIN_MAX_ATTEMPTS:
+                                    raise ValueError("BuffMarket снова вернул форму входа после 3 попыток. Вход не завершён; очередь переходит к следующему аккаунту.")
+                                returned, buff_return_at = False, None
+                                job.credentials = retry_credentials
+                                attempted_cookies.clear()
+                                registration.update(attempts=0, at=0)
+                                job.update(state=f"BuffMarket вернул форму входа. Повторяю авторизацию, попытка {login_attempts + 1} из {LOGIN_MAX_ATTEMPTS}…")
+                            if not pending and not returned and now - signin_at > 5:
                                 signin = page.get_by_text("Sign in", exact=True)
                                 signin_at = now
-                                if steam.count() and steam.first.is_visible():
+                                if steam is not None:
                                     step = "open_steam"
-                                    steam.first.click(no_wait_after=True)
+                                    login_attempts += 1
+                                    # Set before clicking: a timeout after opening the
+                                    # popup must not create another parallel attempt.
+                                    returned = True
+                                    steam.click(no_wait_after=True)
                                 elif signin.count() and signin.first.is_visible():
                                     step = "open_signin"
                                     signin.first.click()
@@ -627,6 +661,7 @@ class BrowserLogins:
             if store:
                 store.conn.close()
             job.credentials = None
+            retry_credentials = None
             while not job.actions.empty():
                 try:
                     job.actions.get_nowait()
