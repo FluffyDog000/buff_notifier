@@ -80,7 +80,10 @@
       <td data-label="Цена">${{ '%.2f'|format(g.price_usd) }}</td>
       <td data-label="CSFloat">${{ '%.2f'|format(g.expected) }}</td>
       <td data-label="Выгода"><span><span class="ok">${{ '%.2f'|format(g.profit) }}</span> <span class="muted">{{ (g.profit_pct * 100)|round|int }}%</span></span></td>
-      <td><details><summary>текст</summary><pre>{{ g.text }}</pre></details></td>
+      <td><details><summary>Подробности</summary>
+        <p class="help">{{ g.basis }}</p>
+        {% if g.profit is not none and g.price_usd is not none %}<p class="help">Выгода после комиссий: ${{ '%.2f'|format(g.price_usd + g.profit) }} − ${{ '%.2f'|format(g.price_usd) }} = ${{ '%.2f'|format(g.profit) }}</p>{% endif %}
+        <pre>{{ g.text }}</pre></details></td>
     </tr>
     {% endfor %}
   </table></div>
