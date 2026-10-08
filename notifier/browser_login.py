@@ -24,7 +24,7 @@ from urllib.parse import unquote, urlsplit
 import requests
 
 from . import buff, config
-from .accounts import Accounts, profile_key, route_keys, SESSION_KEYS
+from .accounts import Accounts, login_key, profile_key, route_keys, SESSION_KEYS
 from .store import Store
 
 log = logging.getLogger("buff.login")
@@ -62,9 +62,11 @@ class Job:
         self.actions = queue.Queue(maxsize=32)
         self.stop = threading.Event()
         self.credentials = credentials
+        self.login_hash = login_key(credentials[0]) if credentials else None
         self.created = time.monotonic()
-        self.done, self.state, self.host, self.image = False, "Открываю браузер…", "", None
+        self.done, self.success, self.state, self.host, self.image = False, False, "Открываю браузер…", "", None
         self.thread = None
+        self.saved_key = None
 
     def update(self, **values):
         with self.lock:
@@ -74,7 +76,7 @@ class Job:
     def public(self):
         with self.lock:
             return dict(id=self.id, account=self.aid, label=self.label, state=self.state,
-                        host=self.host, done=self.done, has_image=self.image is not None,
+                        host=self.host, done=self.done, success=self.success, has_image=self.image is not None,
                         width=WIDTH, height=HEIGHT)
 
     def action(self, kind, values):
@@ -105,6 +107,34 @@ class Job:
             raise ValueError("Дождитесь выполнения предыдущего действия.") from None
 
 
+class Batch:
+    def __init__(self, entries, owner, auto_enable):
+        self.id, self.owner, self.auto_enable = uuid.uuid4().hex, owner, auto_enable
+        self.entries = entries
+        self.lock, self.stop = threading.Lock(), threading.Event()
+        self.created, self.done, self.thread = time.monotonic(), False, None
+        self.rows = [dict(id=r["id"], label=r["label"], created=r["created"], state="queued", message="В очереди", job=None) for r in entries]
+
+    def update(self, index, **values):
+        with self.lock:
+            self.rows[index].update(values)
+
+    def public(self):
+        with self.lock:
+            rows = [r.copy() for r in self.rows]
+            return dict(id=self.id, done=self.done, auto_enable=self.auto_enable, rows=rows,
+                        total=len(rows), created=sum(r["created"] for r in rows),
+                        ok=sum(r["state"] in ("ok", "ready") for r in rows),
+                        failed=sum(r["state"] == "error" for r in rows),
+                        waiting=sum(r["state"] == "queued" for r in rows))
+
+    def cancel(self):
+        with self.lock:
+            self.stop.set()
+            for entry in self.entries:
+                entry["password"] = ""
+
+
 class BrowserLogins:
     def __init__(self, accounts: Accounts, store_path, settings_path, client_factory=buff.from_config,
                  http_get=requests.get, browser_runner=None):
@@ -112,8 +142,10 @@ class BrowserLogins:
         self.client_factory, self.http_get = client_factory, http_get
         self.runner = browser_runner or self._run
         self.lock, self.jobs = threading.Lock(), {}
+        self.batches = {}
+        self.closed = False
 
-    def start(self, aid: str, owner: str, username="", password="") -> Job:
+    def start(self, aid: str, owner: str, username="", password="", _batch_id=None) -> Job:
         a = next((a for a in self.accounts.list() if a["id"] == aid), None)
         if not a:
             raise ValueError("Аккаунт не найден.")
@@ -121,8 +153,14 @@ class BrowserLogins:
         if bool(username) != bool(password) or len(username) > 255 or len(password) > 512:
             raise ValueError("Укажите логин и пароль вместе либо оставьте оба поля пустыми.")
         with self.lock:
+            if self.closed:
+                raise ValueError("Служба перезапускается. Повторите вход позже.")
+            if any(not b.done and b.id != _batch_id for b in self.batches.values()):
+                raise ValueError("Сначала завершите или отмените массовый вход.")
             if any(not j.done for j in self.jobs.values()):
                 raise ValueError("Сначала завершите или отмените уже открытое окно входа.")
+            if username and any(p["id"] != aid and p.get("steam_login_hash") == login_key(username) for p in self.accounts.list()):
+                raise ValueError("Этот Steam-логин уже привязан к другому профилю.")
             self.jobs = {jid: j for jid, j in self.jobs.items() if time.monotonic() - j.created < LIFETIME}
             job = Job(aid, a["label"], owner, (username, password) if username else None)
             self.jobs[job.id] = job
@@ -130,17 +168,126 @@ class BrowserLogins:
             job.thread.start()
             return job
 
+    def start_bulk(self, rows, owner, interval=None, auto_enable=True):
+        with self.lock:
+            if self.closed:
+                raise ValueError("Служба перезапускается. Повторите импорт позже.")
+            if any(not b.done for b in self.batches.values()) or any(not j.done for j in self.jobs.values()):
+                raise ValueError("Сначала завершите или отмените открытый вход.")
+            entries = self.accounts.import_bulk(rows, interval)
+            batch = Batch(entries, owner, auto_enable)
+            # Keep only compact completed summaries, never old credentials.
+            completed = [b for b in self.batches.values() if b.done][-9:]
+            self.batches = {b.id: b for b in completed}
+            self.batches[batch.id] = batch
+            batch.thread = threading.Thread(target=self._run_bulk, args=(batch,), daemon=True, name="buff-bulk-login")
+            batch.thread.start()
+            return batch
+
+    def get_batch(self, bid, owner):
+        with self.lock:
+            batch = self.batches.get(bid)
+            return batch if batch and batch.owner == owner else None
+
+    def cancel_batch(self, batch):
+        batch.cancel()
+        with batch.lock:
+            job_ids = {row["job"] for row in batch.rows}
+        with self.lock:
+            jobs = list(self.jobs.values())
+        for job in jobs:
+            if not job.done and job.id in job_ids:
+                job.stop.set()
+
+    def owned_batches(self, owner):
+        with self.lock:
+            return [b for b in self.batches.values() if b.owner == owner]
+
+    def _run_bulk(self, batch):
+        store = None
+        try:
+            store = Store(self.store_path)
+            for index, entry in enumerate(batch.entries):
+                password = ""
+                if batch.stop.is_set():
+                    break
+                try:
+                    profile = next((a for a in self.accounts.list() if a["id"] == entry["id"]), None)
+                    if not profile:
+                        raise ValueError("Профиль удалён.")
+                    if profile["BUFF_PROXY"] != entry["proxy"]:
+                        raise ValueError("Прокси изменён после импорта. Повторите вход отдельно.")
+                    expired = store.get_status(f"account:{profile['id']}:session_expired")
+                    healthy = bool(profile["BUFF_COOKIE"] and profile.get("egress_ip") and
+                                   store.get_status(f"account:{profile['id']}:session") == "работает" and
+                                   expired != hashlib.sha256(profile["BUFF_COOKIE"].encode()).hexdigest()[:16])
+                    if healthy:
+                        if batch.auto_enable:
+                            self.accounts.enable_verified(profile["id"], profile_key(profile))
+                        entry["password"] = ""
+                        batch.update(index, state="ready", message="Сессия уже проверена")
+                        continue
+                    batch.update(index, state="running", message="Открываю вход…")
+                    with batch.lock:
+                        password, entry["password"] = entry["password"], ""
+                    if batch.stop.is_set():
+                        break
+                    job = self.start(entry["id"], batch.owner, entry["username"], password, _batch_id=batch.id)
+                    del password
+                    batch.update(index, job=job.id)
+                    while not job.done:
+                        if batch.stop.is_set():
+                            job.stop.set()
+                        batch.update(index, message=job.public()["state"])
+                        job.thread.join(timeout=.5)
+                    if batch.stop.is_set():
+                        batch.update(index, state="cancelled", message="Вход отменён")
+                        break
+                    if job.success:
+                        if batch.auto_enable:
+                            self.accounts.enable_verified(entry["id"], job.saved_key)
+                        batch.update(index, state="ok", message="Сессия проверена; опрос включён" if batch.auto_enable else "Сессия проверена")
+                    else:
+                        batch.update(index, state="error", message=job.public()["state"])
+                except ValueError as e:
+                    entry["password"] = ""
+                    batch.update(index, state="error", message=str(e))
+                except Exception as e:
+                    entry["password"] = ""
+                    log.warning("Ошибка массового входа %s: %s", entry["id"], type(e).__name__)
+                    batch.update(index, state="error", message="Не удалось обработать аккаунт. Повторите вход отдельно.")
+                finally:
+                    password = ""
+                    entry["password"] = ""
+        finally:
+            batch.cancel()
+            with batch.lock:
+                for row in batch.rows:
+                    if row["state"] in ("queued", "running"):
+                        row.update(state="cancelled", message="Очередь остановлена")
+                batch.done = True
+            if store:
+                store.conn.close()
+
     def get(self, jid: str, owner: str) -> Job | None:
         with self.lock:
             job = self.jobs.get(jid)
             return job if job and job.owner == owner else None
 
     def close(self):
-        for job in list(self.jobs.values()):
+        with self.lock:
+            self.closed = True
+            batches, jobs = list(self.batches.values()), list(self.jobs.values())
+        for batch in batches:
+            self.cancel_batch(batch)
+        for job in jobs:
             job.stop.set()
-        for job in list(self.jobs.values()):
+        for job in jobs:
             if job.thread:
                 job.thread.join(timeout=25)
+        for batch in batches:
+            if batch.thread:
+                batch.thread.join(timeout=5)
 
     def _prepare_route(self, job, a, store):
         proxy = a["BUFF_PROXY"]
@@ -203,10 +350,11 @@ class BrowserLogins:
         finally:
             if hasattr(client, "session"):
                 client.session.close()
-        self.accounts.receive_session(a["id"], profile_key(a), values, ip)
+        self.accounts.receive_session(a["id"], profile_key(a), values, ip, steam_login_hash=job.login_hash)
         store.set_status(f"account:{a['id']}:session", "работает")
         store.set_status(f"account:{a['id']}:session_expired", None)
-        job.update(state="Готово: сессия BuffMarket сохранена и проверена. Можно включить аккаунт.")
+        job.update(success=True, saved_key=profile_key(dict(a, **values)),
+                   state="Готово: сессия BuffMarket сохранена и проверена. Можно включить аккаунт.")
         return True
 
     def _run(self, job, a):

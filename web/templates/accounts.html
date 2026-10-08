@@ -6,6 +6,26 @@
   <p class="muted">У каждого аккаунта своя сессия, пауза и статистика. Для одинакового исходящего IP действует общий темп и общая остановка после 429. Независимость лимитов разных аккаунтов и IP проверяется по фактическим результатам.</p>
   <p class="muted">Новый аккаунт добавляется выключенным: «Войти через Steam» → автоматическое сохранение и проверка сессии → «Включить». Можно также вставить curl вручную. Основной аккаунт использует сессию из прежних настроек.</p>
 </div>
+<div class="card" id="bulk-import">
+  <h2>Массовое добавление аккаунтов и прокси</h2>
+  <form method="post" action="{{ url_for('accounts_bulk_start') }}" autocomplete="off">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Аккаунты Steam — по одному в строке<textarea name="accounts" required autocomplete="off" spellcheck="false" rows="7" placeholder="login1:password1&#10;login2:password2"></textarea></label>
+    <p class="help">Форматы: <code>login:password</code> или <code>login;password;proxy</code>. Если пароль содержит «;», используйте формат с «;» и заключите пароль в двойные кавычки. Двойную кавычку внутри такого пароля удвойте.</p>
+    <label>Прокси — по одному в строке, в том же порядке<textarea name="proxies" autocomplete="off" spellcheck="false" rows="6" placeholder="host1:port:proxy_login:proxy_password&#10;http://proxy_login:proxy_password@host2:port"></textarea></label>
+    <p class="help">Поддерживаются <code>host:port</code>, <code>host:port:login:password</code> и URL HTTP/HTTPS или SOCKS5 без авторизации. Можно указать прокси третьим полем строки аккаунта — тогда оставьте отдельный список пустым. «-» означает адрес сервера. При пустом списке все аккаунты используют адрес сервера.</p>
+    <label class="check"><input type="checkbox" name="shared_proxy">Один прокси из списка использовать для всех аккаунтов</label>
+    <label>Пауза между запросами для новых профилей, с<input type="number" name="interval" min="1" max="600" step="any" value="{{ default_interval }}"></label>
+    <label class="check"><input type="checkbox" name="auto_enable" checked>Включать опрос после успешной проверки сессии и IP</label>
+    <p class="help">Вход выполняется по очереди. Ошибка одного аккаунта не останавливает остальные; при капче можно открыть его окно. Повторный импорт тех же логинов продолжит работу с существующими профилями и пропустит уже проверенные сессии. Общий предел — 200 профилей вместе с основным.</p>
+    <p class="help">Пароли Steam остаются только в памяти до обработки или отмены. При выходе из панели или перезапуске службы очередь остановится; для продолжения вставьте список заново. Список паролей после отправки не показывается.</p>
+    <button>Добавить и запустить массовый вход</button>
+  </form>
+</div>
+{% if batches %}<div class="card">
+  <h2>Последние массовые импорты</h2>
+  {% for b in batches|reverse %}<p><a href="{{ url_for('accounts_bulk', bid=b.id) }}">{{ 'Завершён' if b.done else 'В процессе' }}: {{ b.ok }} из {{ b.total }} готовы · ошибок {{ b.failed }}</a></p>{% endfor %}
+</div>{% endif %}
 {% for a in accounts %}
 <div class="card">
   <h2>{{ a.label }} <span class="pill {{ 'ok' if a.enabled }}">{{ 'включён' if a.enabled else 'выключен' }}</span></h2>

@@ -20,6 +20,10 @@ LOCK = threading.Lock()
 SESSION_KEYS = ("BUFF_COOKIE", "BUFF_CSRF", "BUFF_USER_AGENT", "BUFF_PROXY")
 
 
+def login_key(username: str) -> str:
+    return hashlib.sha256(username.lower().encode()).hexdigest()
+
+
 def profile_key(account: dict) -> str:
     return hashlib.sha256(json.dumps([account.get(k, "") for k in SESSION_KEYS]).encode()).hexdigest()
 
@@ -165,7 +169,7 @@ class Accounts:
             a.update(egress_ip=ip, tested_key=expected_key)
             self._write(profiles)
 
-    def receive_session(self, aid: str, expected_key: str, values: dict, ip: str) -> None:
+    def receive_session(self, aid: str, expected_key: str, values: dict, ip: str, steam_login_hash=None) -> None:
         """Commit a validated browser session only if the profile wasn't edited/deleted."""
         ip = str(ipaddress.ip_address(ip))
         changes = {k: values[k] for k in SESSION_KEYS if k != "BUFF_PROXY" and k in values}
@@ -177,6 +181,8 @@ class Accounts:
                 raise ValueError("Настройки аккаунта изменились; начните вход заново.")
             if any(a["id"] != aid and a["BUFF_COOKIE"] == changes["BUFF_COOKIE"] for a in self.list()):
                 raise ValueError("Эта сессия уже используется другим профилем.")
+            if steam_login_hash and any(a["id"] != aid and a.get("steam_login_hash") == steam_login_hash for a in self.list()):
+                raise ValueError("Этот Steam-логин уже привязан к другому профилю.")
             updated = dict(live, **changes)
             profiles = self._read()
             a = next((a for a in profiles if a["id"] == aid), None)
@@ -188,6 +194,71 @@ class Accounts:
             else:
                 a.update(changes)
             a.update(egress_ip=ip, tested_key=profile_key(updated))
+            if steam_login_hash:
+                a["steam_login_hash"] = steam_login_hash
+            self._write(profiles)
+
+    def import_bulk(self, rows: list[dict], interval: float | None) -> list[dict]:
+        """Validate the entire import before one atomic write; passwords stay in RAM."""
+        if interval is not None and (not math.isfinite(interval) or not 1 <= interval <= 600):
+            raise ValueError("Пауза: от 1 до 600 секунд.")
+        with LOCK:
+            profiles = self._read()
+            live_profiles = self.list()
+            existing = {a.get("steam_login_hash"): a for a in live_profiles if a.get("steam_login_hash")}
+            out, seen = [], set()
+            for row in rows:
+                key = login_key(row["username"])
+                if key in seen:
+                    raise ValueError(f"Строка {row['line']}: логин повторяется в списке.")
+                seen.add(key)
+                proxy = validate_proxy(row["proxy"])
+                a = existing.get(key)
+                if a is None:
+                    # Older browser logins saved a hash in the private profile path.
+                    for old in live_profiles:
+                        marker = self.path.parent / "browser_profiles" / old["id"] / hashlib.sha256(old["BUFF_PROXY"].encode()).hexdigest()[:16] / "last_profile"
+                        try:
+                            old_hash = marker.read_text(encoding="ascii").strip()
+                        except (OSError, UnicodeError):
+                            continue
+                        if old_hash == key[:32]:
+                            a = old
+                            stored = next((p for p in profiles if p["id"] == old["id"]), None)
+                            if stored is None:
+                                stored = {k: old[k] for k in ("id", "label", "enabled", "interval")}
+                                profiles.append(stored)
+                            stored["steam_login_hash"] = key
+                            existing[key] = old
+                            break
+                if a:
+                    if a["BUFF_PROXY"] != proxy:
+                        raise ValueError(f"Строка {row['line']}: у существующего аккаунта другой прокси. Измените его отдельно.")
+                    created = False
+                else:
+                    a = {"id": uuid.uuid4().hex[:16], "label": row["username"][:80], "interval": interval,
+                         "enabled": False, "steam_login_hash": key, **{k: "" for k in SESSION_KEYS}}
+                    a["BUFF_PROXY"] = proxy
+                    profiles.append(a)
+                    existing[key] = a
+                    created = True
+                out.append(dict(row, id=a["id"], label=a["label"], created=created))
+            if sum(a["id"] != "primary" for a in profiles) > 199:
+                raise ValueError("Недостаточно свободных мест: предел 200 профилей вместе с основным.")
+            self._write(profiles)
+            return out
+
+    def enable_verified(self, aid: str, expected_key: str) -> None:
+        with LOCK:
+            a = next((a for a in self.list() if a["id"] == aid), None)
+            if not a or profile_key(a) != expected_key or not a["BUFF_COOKIE"] or not a.get("egress_ip"):
+                raise ValueError("Сессия или настройки изменились; повторите проверку.")
+            profiles = self._read()
+            target = next((p for p in profiles if p["id"] == aid), None)
+            if target is None:
+                target = {k: a[k] for k in ("id", "label", "interval")}
+                profiles.append(target)
+            target["enabled"] = True
             self._write(profiles)
 
     def toggle(self, aid: str) -> None:

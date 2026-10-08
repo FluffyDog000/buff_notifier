@@ -33,6 +33,7 @@ from notifier import buff, candidates, config, sales
 from notifier.buff import BuffError, LoginRequired
 from notifier.accounts import Accounts, profile_key, route_keys, SESSION_KEYS
 from notifier.browser_login import BrowserLogins
+from notifier.bulk_accounts import parse_bulk
 from notifier.envfile import write_env
 from notifier.listings import item_url
 from notifier.poller import daily_load
@@ -61,7 +62,7 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
         write_env(env_path, {"WEB_SECRET_KEY": sec["WEB_SECRET_KEY"]})
     app.config.update(SECRET_KEY=sec["WEB_SECRET_KEY"], SESSION_COOKIE_SECURE=True,
                       SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
-                      PERMANENT_SESSION_LIFETIME=timedelta(days=30))
+                      PERMANENT_SESSION_LIFETIME=timedelta(days=30), MAX_CONTENT_LENGTH=1024 * 1024)
     store = Store(store_path)
     accounts = Accounts(accounts_path or Path(store_path).parent / "accounts.json", env_path)
     logins = login_factory(accounts, store_path, settings_path, client_factory=client_factory, http_get=http_get)
@@ -127,7 +128,11 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
     @app.route("/logout", methods=["POST"])
     def logout():
         owner = hashlib.sha256(session.get("csrf", "").encode()).hexdigest()
-        for job in list(logins.jobs.values()):
+        for batch in logins.owned_batches(owner):
+            logins.cancel_batch(batch)
+        with logins.lock:
+            jobs = list(logins.jobs.values())
+        for job in jobs:
             if job.owner == owner:
                 job.stop.set()
         session.clear()
@@ -183,7 +188,11 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
                          "ip": a.get("egress_ip"), "session_state": store.get_status(f"account:{aid}:session") or "не проверялась",
                          "pause_until": max(store.get_status(f"account:{aid}:pause_until") or "",
                                             store.route_pause(routes[aid]) or "") or None, "metrics": metrics})
-        return render_template("accounts.html", accounts=rows, default_interval=s["request_interval"])
+        batches = [b.public() for b in logins.owned_batches(browser_owner())]
+        response = app.make_response(render_template("accounts.html", accounts=rows,
+                                    batches=batches, default_interval=s["request_interval"]))
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.route("/accounts/save", methods=["POST"])
     def accounts_save():
@@ -296,6 +305,46 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
         if job is None:
             abort(404)
         return job
+
+    def browser_batch(bid):
+        batch = logins.get_batch(bid, browser_owner())
+        if batch is None:
+            abort(404)
+        return batch
+
+    @app.route("/accounts/bulk", methods=["POST"])
+    def accounts_bulk_start():
+        try:
+            rows = parse_bulk(request.form.get("accounts", ""), request.form.get("proxies", ""),
+                              shared_proxy=bool(request.form.get("shared_proxy")))
+            raw = request.form.get("interval", "").strip()
+            try:
+                interval = float(raw.replace(",", ".")) if raw else None
+            except ValueError:
+                raise ValueError("Пауза должна быть числом от 1 до 600 секунд.") from None
+            batch = logins.start_bulk(rows, browser_owner(), interval,
+                                      auto_enable=bool(request.form.get("auto_enable")))
+            return redirect(url_for("accounts_bulk", bid=batch.id))
+        except ValueError as e:
+            flash(str(e), "error")
+            return redirect(url_for("accounts_page"))
+
+    @app.route("/accounts/bulk/<bid>")
+    def accounts_bulk(bid):
+        response = app.make_response(render_template("bulk_accounts.html", batch=browser_batch(bid).public()))
+        response.headers.update({"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY"})
+        return response
+
+    @app.route("/accounts/bulk/<bid>/status")
+    def accounts_bulk_status(bid):
+        response = jsonify(browser_batch(bid).public())
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/accounts/bulk/<bid>/cancel", methods=["POST"])
+    def accounts_bulk_cancel(bid):
+        logins.cancel_batch(browser_batch(bid))
+        return redirect(url_for("accounts_bulk", bid=bid))
 
     def start_browser(aid):
         try:
