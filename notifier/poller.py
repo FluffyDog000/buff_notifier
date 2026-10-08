@@ -23,6 +23,8 @@ from pathlib import Path
 import requests
 
 from . import buff, config, phases, sales
+from .names import vanilla
+from .localtime import moscow
 from .buff import BuffError, LoginRequired
 from .judge import HISTORY_DAYS, Market, judge, message
 from .listings import item_url, parse_page
@@ -101,7 +103,7 @@ class Poller:
 
         try:
             body = (client.sell_orders(params["goods_id"], page_size=params["page_size"])
-                    if kind == "poll" else client.search_goods(params["query"]))
+                    if kind == "poll" else client.search_goods(params["query"], **params.get("search_options", {})))
         except LoginRequired as e:
             record("expired", e.status)
             raise
@@ -138,7 +140,7 @@ class Poller:
             return IDLE
         until = self.store.get_status("pause_until")
         if until and datetime.fromisoformat(until) > now:
-            self.store.set_status("state", f"пауза после 429 до {until[11:16]} UTC")
+            self.store.set_status("state", f"пауза после 429 до {moscow(datetime.fromisoformat(until)):%H:%M} МСК")
             return min(IDLE, (datetime.fromisoformat(until) - now).total_seconds())
 
         try:
@@ -208,7 +210,7 @@ class Poller:
             self.store.polled(gid, now, 0, None,
                               "нет такого предмета в базе CSFloat")
             return 0.0
-        rows = sales.sales_for(db, item_id, HISTORY_DAYS, now)
+        rows = sales.sales_for(db, item_id, HISTORY_DAYS, now, include_missing_float=vanilla(name))
         rate = sum(1 for r in rows
                    if r["age_days"] is not None and r["age_days"] <= RATE_DAYS) / RATE_DAYS
         market = Market.build(rows, s["window_days"])
@@ -256,8 +258,7 @@ class Poller:
         self.store.set_status("last_429", until)
         log.warning("BuffMarket: 429, пауза %ds", wait)
         self.alert_once(tg, "alerted_429", now.strftime("%Y-%m-%d"),
-                        f"⚠️ BuffMarket ограничивает запросы (429), пауза до {until[11:16]} UTC.\n"
-                        "Если повторяется — сократите список или увеличьте паузу.")
+                        f"⏳ BuffMarket: лимит 429. Пауза до {moscow(datetime.fromisoformat(until)):%d.%m %H:%M} МСК.")
 
     def resolve(self, p: dict, s: dict, sec: dict, tg: Telegram, now: datetime,
                 cookie: str) -> float:
@@ -266,8 +267,11 @@ class Poller:
         item and the listings carry the paint index."""
         name = p["name"]
         base = phases.split(name)[0]
+        page = p.get("search_page", 1)
+        size = 50 if vanilla(base) else 20
+        options = {"page_size": size, "page_num": page} if vanilla(base) or page > 1 else {}
         try:
-            body = self.request("search", s, sec, now, query=base)
+            body = self.request("search", s, sec, now, query=base, search_options=options)
         except LoginRequired:
             self.session_expired(tg, cookie)
             return 0.0
@@ -281,9 +285,15 @@ class Poller:
         self.store.set_status("session", "работает")
         gid = buff.match_goods(body, base)
         if gid is None:
-            found = len((body.get("data") or {}).get("items") or [])
-            self.store.fail_pending(name, f"не найден на BuffMarket (результатов поиска: {found})")
-            log.info("%s: goods_id не найден", name)
+            data = body.get("data") or {}
+            found = len(data.get("items") or [])
+            try:
+                total_pages = int(data.get("total_page"))
+            except (TypeError, ValueError):
+                total_pages = page + 1 if found >= size else page
+            exhausted = page >= total_pages or not found or page >= 20
+            self.store.search_progress(name, page if exhausted else page + 1, exhausted)
+            log.info("%s: goods_id не найден на странице %d", name, page)
         else:
             self.store.resolve_pending(name, gid)
             log.info("%s: goods_id %d, добавлен в опрос", name, gid)

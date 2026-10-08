@@ -49,7 +49,7 @@ def test_a_premium_float_at_an_ordinary_price_is_flagged():
     v = judge(lot(101.0, 0.1534), NAME, MARKET, S)
     assert v.kind == "float"
     assert v.normal == 100.0 and v.normal_lo == 0.16 and round(v.premium, 2) == 0.20
-    assert "дороже соседней 0.16" in message(lot(101.0, 0.1534), NAME, v, "https://x")
+    assert "💎 Выгодный float" in message(lot(101.0, 0.1534), NAME, v, "https://x")
 
 
 def test_a_premium_float_at_a_premium_price_is_not():
@@ -77,13 +77,46 @@ def test_a_doppler_phase_keeps_only_its_own_listings():
     assert judge(lot(80.0, 0.0112, idx=418), name, MARKET, S).reason == "другая фаза"
 
 
-def test_the_message_says_what_the_brief_asks_for():
+def test_the_message_is_compact_and_uses_moscow_time():
     x = lot(80.0, 0.1612, seed=217, bargain_floor=70.0, stickers=["Swallow"])
     text = message(x, NAME, judge(x, NAME, MARKET, S), "https://buff.market/x")
-    for part in ("Дешевле рынка", NAME, "Float 0.16120", "паттерн 217", "Swallow",
-                 "$80.00", "торг от $70.00", "$100.00", "$98.00", "$18.00",
-                 "сотая 0.16–0.17", "(8 продаж)", "(24 продаж)", "https://buff.market/x", "Лот L80.0-0.1612"):
+    for part in ("Дешевле рынка", NAME, "Float 0.16120", "$80.00", "$100.00", "$18.00",
+                 "float 0.16–0.17", "16 дн.", "https://buff.market/x", "07.10 03:00 МСК"):
         assert part in text, part
+    assert len(text.splitlines()) == 8 and len(text) < 400
+    assert "UTC" not in text and "Лот " not in text and "Swallow" not in text
+    x.created_at = x.created_at.replace(hour=23, minute=30)
+    assert "08.10 02:30 МСК" in message(x, NAME, judge(x, NAME, MARKET, S), 'https://x')
+
+
+def test_either_median_accepts_one_discount_while_min_requires_both():
+    market = Market.build(sales({.15: 120., .16: 100., .17: 98.}), 16)
+    s = dict(S, price_basis="either", discount_basis="median", min_discount=.2, float_signal=False)
+    v = judge(lot(95., .155), NAME, market, s)
+    assert v.kind == "cheap" and v.expected == 120. and "float" in v.reference
+    assert judge(lot(95., .155), NAME, market, dict(s, price_basis="min")).kind is None
+    # A cheap item also works with no five-sale sample in its hundredth.
+    v = judge(lot(80., .455), NAME, market, s)
+    assert v.kind == "cheap" and v.expected == 100. and "весь предмет" in v.reference
+
+
+def test_discount_and_return_are_distinct_and_boundary_is_inclusive():
+    s = dict(S, price_basis="bucket", discount_basis="median", min_discount=.2, float_signal=False)
+    assert judge(lot(80., .165), NAME, MARKET, s).kind == "cheap"
+    assert judge(lot(80.01, .165), NAME, MARKET, s).kind is None
+    assert judge(lot(80., .165), NAME, MARKET, dict(s, discount_basis="net")).kind is None
+    assert judge(lot(80., .165), NAME, MARKET, dict(s, min_profit_pct=.23)).kind is None
+    assert judge(lot(80., .165), NAME, MARKET, dict(s, min_profit_pct=.2)).kind == "cheap"
+
+
+def test_vanilla_knife_is_valued_without_float_and_never_has_float_signal():
+    market = Market.build([dict(price=100., float_value=None, age_days=i) for i in range(5)], 16)
+    x = lot(75., None)
+    v = judge(x, "★ Survival Knife", market, S)
+    assert v.kind == "cheap" and v.expected == 100. and market.window == 16
+    assert "ванильный нож" in message(x, "★ Survival Knife", v, "https://x")
+    assert "🔬" not in message(x, "★ Survival Knife", v, "https://x")
+    assert judge(x, NAME, market, S).reason == "нет float"
 
 
 def test_a_thin_hundredth_inflated_by_rare_sales_is_held_to_the_item_median():

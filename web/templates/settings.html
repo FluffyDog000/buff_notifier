@@ -1,7 +1,45 @@
 {% extends "base.html" %}{% block title %}Настройки{% endblock %}
 {% block body %}
 <div class="card">Опрос идёт непрерывно по кругу для всех активных предметов. Дополнительные сессии и прокси добавляются на странице <a href="{{ url_for('accounts_page') }}">«Аккаунты»</a>. Ниже — сессия и прокси основного аккаунта.</div>
-<h1>Настройки</h1>
+<div class="settings-heading"><h1>Настройки</h1><button form="signal-settings">Сохранить настройки</button></div>
+<form method="post" action="{{ url_for('settings_save') }}" id="signal-settings">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  {% for g in groups %}
+  <div class="card">
+    <h2>{{ g }}</h2>
+    {% if g == 'Сигналы' %}
+    <p>Сигнал приходит, если выполняется выбранное условие цены и фильтры минимальной выгоды. Все комиссии учитываются в расчёте выгоды.</p>
+    <div class="signal-example" id="signal-example" aria-live="polite"></div>
+    {% endif %}
+    {% for f in fields if f.group == g %}
+      {% if f.key == 'float_signal' %}<details class="section-fold row"><summary>Float и особые случаи</summary><div style="width:100%">{% endif %}
+      {% if f.key == 'csfloat_db' %}<details class="section-fold row"><summary>Источник базы CSFloat</summary><div style="width:100%">{% endif %}
+      {% if f.kind == 'bool' %}
+        <label class="check"><input type="checkbox" name="{{ f.key }}" {{ 'checked' if s[f.key] }}> {{ f.label }}</label>
+      {% else %}
+        <label for="{{ f.key }}">{{ f.label }}</label>
+        {% if f.kind == 'choice' %}
+          <select id="{{ f.key }}" name="{{ f.key }}">
+            {% for v, t in f.choices %}<option value="{{ v }}" {{ 'selected' if s[f.key] == v }}>{{ t }}</option>{% endfor %}
+          </select>
+        {% elif f.kind == 'pct' %}
+          <input id="{{ f.key }}" type="number" step="any" name="{{ f.key }}" value="{{ '%g'|format(s[f.key] * 100) }}">
+        {% elif f.kind == 'str' %}
+          <input id="{{ f.key }}" type="text" name="{{ f.key }}" value="{{ s[f.key] }}">
+        {% else %}
+          <input id="{{ f.key }}" type="number" step="any" name="{{ f.key }}" value="{{ '%g'|format(s[f.key]) }}">
+        {% endif %}
+      {% endif %}
+      {% if errors.get(f.key) %}<div class="fielderr">{{ errors[f.key] }}</div>{% endif %}
+      {% if f.help %}<div class="help">{{ f.help }}</div>{% endif %}
+    {% endfor %}
+    {% if g in ('Сигналы', 'Опрос') %}</div></details>{% endif %}
+  </div>
+  {% endfor %}
+  <div class="settings-save"><button>Сохранить настройки</button></div>
+</form>
+
+<details class="section-fold"><summary>Подключения: основная сессия, прокси и Telegram</summary>
 
 <div class="card" id="session">
   <h2>Сессия BuffMarket</h2>
@@ -59,33 +97,5 @@
   <div class="help">Чтобы найти chat id: напишите боту /start, затем «Найти chat id».</div>
 </div>
 
-<form method="post" action="{{ url_for('settings_save') }}">
-  <input type="hidden" name="csrf" value="{{ csrf }}">
-  {% for g in groups %}
-  <div class="card">
-    <h2>{{ g }}</h2>
-    {% for f in fields if f.group == g %}
-      {% if f.kind == 'bool' %}
-        <label class="check"><input type="checkbox" name="{{ f.key }}" {{ 'checked' if s[f.key] }}> {{ f.label }}</label>
-      {% else %}
-        <label for="{{ f.key }}">{{ f.label }}</label>
-        {% if f.kind == 'choice' %}
-          <select id="{{ f.key }}" name="{{ f.key }}">
-            {% for v, t in f.choices %}<option value="{{ v }}" {{ 'selected' if s[f.key] == v }}>{{ t }}</option>{% endfor %}
-          </select>
-        {% elif f.kind == 'pct' %}
-          <input id="{{ f.key }}" type="number" step="any" name="{{ f.key }}" value="{{ '%g'|format(s[f.key] * 100) }}">
-        {% elif f.kind == 'str' %}
-          <input id="{{ f.key }}" type="text" name="{{ f.key }}" value="{{ s[f.key] }}">
-        {% else %}
-          <input id="{{ f.key }}" type="number" step="any" name="{{ f.key }}" value="{{ '%g'|format(s[f.key]) }}">
-        {% endif %}
-      {% endif %}
-      {% if errors.get(f.key) %}<div class="fielderr">{{ errors[f.key] }}</div>{% endif %}
-      {% if f.help %}<div class="help">{{ f.help }}</div>{% endif %}
-    {% endfor %}
-  </div>
-  {% endfor %}
-  <div class="row" style="margin-bottom:24px"><button>Сохранить настройки</button></div>
-</form>
+</details>
 {% endblock %}

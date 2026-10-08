@@ -210,6 +210,67 @@ def test_the_overview_shows_signals_and_state(app):
     assert NAME in page and "$18.00" in page and "истекла" in page and "1 предметов" in page
 
 
+def test_items_selection_is_explicit_guarded_and_preserves_filters(app):
+    c = logged_in(app)
+    st = Store(app.tmp / 'buff.db')
+    for gid in (1, 2, 3):
+        st.add_watch(gid, f'Item {gid}')
+    assert c.post('/items/selection', data={'ids': ['1', '2'], 'action': 'delete'}).status_code == 400
+    token = csrf(c, '/items')
+    r = c.post('/items/selection', data={'csrf': token, 'ids': ['1', '2'], 'action': 'disable', 'q': 'Item'})
+    assert 'q=Item' in r.location
+    assert [w['active'] for w in st.watch_list()] == [0, 0, 1]
+    assert c.post('/items/selection', data={'csrf': token, 'ids': ['bad'], 'action': 'delete'}).status_code == 400
+    assert len(st.watch_list()) == 3
+    c.post('/items/selection', data={'csrf': token, 'ids': ['1', '2'], 'action': 'delete'})
+    assert [w['goods_id'] for w in st.watch_list()] == [3]
+
+
+def test_lists_filter_and_paginate_and_render_compact_accounts(app):
+    c = logged_in(app)
+    st = Store(app.tmp / 'buff.db')
+    for gid in range(65):
+        st.add_watch(gid, f'Skin {gid:03}')
+    body = c.get('/items?per_page=25&page=2').get_data(as_text=True)
+    assert 'Skin 025' in body and 'Skin 049' in body and 'Skin 050' not in body and 'Skin 000' not in body
+    body = c.get('/items?q=Skin+064').get_data(as_text=True)
+    assert 'Skin 064' in body and 'Skin 063' not in body
+    body = c.get('/accounts').get_data(as_text=True)
+    assert 'accounts-selection' in body and 'name="q"' in body and '<summary>Управление</summary>' in body
+
+
+def test_vanilla_bare_name_resolves_to_csfloat_name_and_pending_can_retry(app):
+    db = sqlite3.connect(app.tmp / 'csfloat.db')
+    db.execute('INSERT INTO items VALUES (2, ?, 1)', ('★ Survival Knife',))
+    db.commit()
+    db.close()
+    c = logged_in(app)
+    token = csrf(c, '/items')
+    c.post('/items/add', data={'csrf': token, 'lines': 'Survival Knife'})
+    st = Store(app.tmp / 'buff.db')
+    assert st.pending_list()[0]['name'] == '★ Survival Knife'
+    st.search_progress('★ Survival Knife', 3, True)
+    assert not st.next_pending()
+    c.post('/items/pending/retry', data={'csrf': token})
+    assert st.next_pending()['tries'] == 0 and st.next_pending()['search_page'] == 1
+
+
+def test_account_bulk_enable_checks_all_sessions_before_any_change(app):
+    from notifier.accounts import Accounts, profile_key
+    reg = Accounts(app.tmp / 'accounts.json', app.tmp / '.env')
+    a = reg.save(None, 'Ready', {'BUFF_COOKIE': 'session=1'}, 'http://proxy:80', 5)
+    b = reg.save(None, 'Not ready', {'BUFF_COOKIE': 'session=2'}, 'http://proxy:80', 5)
+    reg.tested(a, profile_key(next(p for p in reg.list() if p['id'] == a)), '1.2.3.4')
+    c = logged_in(app)
+    token = csrf(c, '/accounts')
+    c.post('/accounts/selection', data={'csrf': token, 'ids': [a, b], 'action': 'enable'})
+    assert not any(p['enabled'] for p in reg.list() if p['id'] in (a, b))
+    c.post('/accounts/selection', data={'csrf': token, 'ids': [a], 'action': 'enable'})
+    assert next(p for p in reg.list() if p['id'] == a)['enabled']
+    c.post('/accounts/selection', data={'csrf': token, 'ids': [a, b], 'action': 'disable'})
+    assert not any(p['enabled'] for p in reg.list() if p['id'] in (a, b))
+
+
 def test_accounts_require_login_and_csrf_and_never_render_credentials(app):
     from notifier.accounts import Accounts
     assert app.test_client().get("/accounts").status_code == 302

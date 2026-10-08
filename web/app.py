@@ -30,6 +30,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
 from notifier import buff, candidates, config, sales
+from notifier.names import known_name
 from notifier.buff import BuffError, LoginRequired
 from notifier.accounts import Accounts, profile_key, route_keys, SESSION_KEYS
 from notifier.browser_login import BrowserLogins
@@ -47,6 +48,27 @@ MAX_FAILS = 5
 LOCK_SECONDS = 15 * 60
 LOOKUPS_PER_SUBMIT = 10
 TEST_GOODS_ID = 5777          # Desert Eagle | Mecha Industries (MW): any item will do
+
+
+def list_view(rows, source):
+    q = source.get("q", "").strip()[:200]
+    status = source.get("status", "all")
+    if status not in ("all", "enabled", "disabled"):
+        status = "all"
+    try:
+        per_page = int(source.get("per_page", 50))
+        page = max(1, int(source.get("page", 1)))
+    except (ValueError, TypeError):
+        per_page, page = 50, 1
+    if per_page not in (25, 50, 100):
+        per_page = 50
+    filtered = [r for r in rows if q.casefold() in " ".join(str(r.get(k) or "") for k in
+                ("name", "label", "goods_id", "ip", "proxy")).casefold()
+                and (status == "all" or bool(r.get("active", r.get("enabled"))) == (status == "enabled"))]
+    pages = max(1, (len(filtered) + per_page - 1) // per_page)
+    page = min(page, pages)
+    return filtered[(page - 1) * per_page:page * per_page], dict(q=q, status=status,
+                per_page=per_page, page=page, pages=pages, count=len(filtered), total=len(rows))
 
 
 def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = config.SETTINGS_PATH,
@@ -74,6 +96,11 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
 
     def secrets() -> dict:
         return config.load_secrets(env_path)
+
+    def back_to_list(endpoint):
+        _, view = list_view([], request.form)
+        return redirect(url_for(endpoint, **{k: request.form.get(k, view[k]) for k in
+                                             ("q", "status", "page", "per_page")}))
 
     def client_ip() -> str:
         return request.remote_addr or "?"
@@ -182,14 +209,19 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
         for a in profiles:
             aid = a["id"]
             metrics = store.measurement_stats(account_id=aid)["current"]
+            pause_until = max(store.get_status(f"account:{aid}:pause_until") or "",
+                              store.route_pause(routes[aid]) or "") or None
             rows.append({"id": aid, "label": a["label"], "enabled": a["enabled"],
                          "interval": a["interval"] or s["request_interval"],
                          "proxy": buff.proxy_display(a["BUFF_PROXY"]), "has_cookie": bool(a["BUFF_COOKIE"]),
                          "ip": a.get("egress_ip"), "session_state": store.get_status(f"account:{aid}:session") or "не проверялась",
-                         "pause_until": max(store.get_status(f"account:{aid}:pause_until") or "",
-                                            store.route_pause(routes[aid]) or "") or None, "metrics": metrics})
+                         "pause_until": pause_until,
+                         "pause_active": bool(pause_until and datetime.fromisoformat(pause_until) > datetime.now(timezone.utc)),
+                         "metrics": metrics})
         batches = [b.public() for b in logins.owned_batches(browser_owner())]
-        response = app.make_response(render_template("accounts.html", accounts=rows,
+        shown, view = list_view(rows, request.args)
+        response = app.make_response(render_template("accounts.html", accounts=shown, view=view,
+                                    enabled_count=sum(a["enabled"] for a in rows),
                                     batches=batches, default_interval=s["request_interval"]))
         response.headers["Cache-Control"] = "no-store"
         return response
@@ -221,7 +253,23 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
             accounts.toggle(aid)
         except ValueError as e:
             flash(str(e), "error")
-        return redirect(url_for("accounts_page"))
+        return back_to_list("accounts_page")
+
+    @app.route("/accounts/selection", methods=["POST"])
+    def accounts_selection():
+        action = request.form.get("action")
+        if action not in ("enable", "disable"):
+            abort(400)
+        ids = request.form.getlist("ids")
+        if not ids:
+            flash("Выберите аккаунты в списке.", "error")
+        else:
+            try:
+                n = accounts.set_enabled(ids, action == "enable")
+                flash(f"Аккаунтов изменено: {n}.", "ok")
+            except ValueError as e:
+                flash(str(e), "error")
+        return back_to_list("accounts_page")
 
     @app.route("/accounts/<aid>/remove", methods=["POST"])
     def accounts_remove(aid):
@@ -419,7 +467,8 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
                 conn.close()
             except (ValueError, sqlite3.Error) as e:
                 flash(f"Не подобрал: {e}", "error")
-        return render_template("items.html", watch=store.watch_list(), names=csfloat_names(s),
+        shown, view = list_view(store.watch_list(), request.args)
+        return render_template("items.html", watch=shown, view=view, names=csfloat_names(s),
                                pending=store.pending_list(), picked=picked, pick=pick_args,
                                url=item_url)
 
@@ -436,6 +485,12 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
         store.remove_pending(request.form.get("name") or None)
         return redirect(url_for("items"))
 
+    @app.route("/items/pending/retry", methods=["POST"])
+    def pending_retry():
+        store.retry_pending(request.form.get("name") or None)
+        flash("Поиск goods_id запущен повторно.", "ok")
+        return redirect(url_for("items"))
+
     @app.route("/items/add", methods=["POST"])
     def items_add():
         s, sec = settings(), secrets()
@@ -448,6 +503,7 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
                 gid = int(gid_text.strip())
             except ValueError:
                 # A bare name: its goods_id is for the notifier to find.
+                ln = known_name(ln, known)
                 if known and ln not in known:
                     flash(f"«{ln}» нет среди предметов CSFloat-бота.", "error")
                 else:
@@ -469,6 +525,7 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
                 if not name:
                     flash(f"{gid}: BuffMarket не назвал предмет. Впишите название.", "error")
                     continue
+            name = known_name(name, known)
             if known and name not in known:
                 flash(f"{gid}: «{name}» нет среди предметов CSFloat-бота — оценивать не по чему. "
                       "Для фаз Doppler укажите название с фазой.", "error")
@@ -486,12 +543,28 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
         row = next((w for w in store.watch_list() if w["goods_id"] == gid), None)
         if row:
             store.set_active(gid, not row["active"])
-        return redirect(url_for("items"))
+        return back_to_list("items")
 
     @app.route("/items/<int:gid>/delete", methods=["POST"])
     def items_delete(gid):
         store.remove_watch(gid)
-        return redirect(url_for("items"))
+        return back_to_list("items")
+
+    @app.route("/items/selection", methods=["POST"])
+    def items_selection():
+        action = request.form.get("action")
+        if action not in ("delete", "enable", "disable"):
+            abort(400)
+        try:
+            ids = list({int(i) for i in request.form.getlist("ids")})
+        except ValueError:
+            abort(400)
+        if ids:
+            n = store.edit_watch(ids, action)
+            flash(f"Предметов {'удалено' if action == 'delete' else 'изменено'}: {n}.", "ok")
+        else:
+            flash("Выберите предметы в списке.", "error")
+        return back_to_list("items")
 
     # -- settings ---------------------------------------------------------------
 

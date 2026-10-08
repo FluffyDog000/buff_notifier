@@ -34,14 +34,14 @@ def item_id(conn: sqlite3.Connection, name: str) -> int | None:
 
 
 def sales_for(conn: sqlite3.Connection, item_id: int, days: float,
-              now: datetime | None = None) -> list[dict]:
+              now: datetime | None = None, include_missing_float: bool = False) -> list[dict]:
     """Sales with a float in the last `days`, each with `age_days` attached -
     the shape `estimate` and `recency.to_today` read."""
     now = now or datetime.now(timezone.utc)
     cutoff = (now - timedelta(days=days)).isoformat()
     rows = [dict(r) for r in conn.execute(
         "SELECT price, float_value, paint_seed, paint_index, sold_at FROM sales "
-        "WHERE item_id = ? AND float_value IS NOT NULL AND price > 0 "
+        "WHERE item_id = ? " + ("" if include_missing_float else "AND float_value IS NOT NULL ") + "AND price > 0 "
         "AND sold_at >= ?", (item_id, cutoff))]
     for s in rows:
         try:

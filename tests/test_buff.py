@@ -1,7 +1,7 @@
 """The request is the item page's own, sent one at a time."""
 import pytest
 
-from notifier.buff import API, SELL_ORDER, BuffClient, BuffError, LoginRequired
+from notifier.buff import API, SELL_ORDER, BuffClient, BuffError, LoginRequired, match_goods
 
 
 class Resp:
@@ -77,3 +77,19 @@ def test_a_429_says_so_with_its_wait():
     with pytest.raises(BuffError) as e:
         c.sell_orders(1)
     assert e.value.status == 429 and e.value.retry_after == 60.0
+
+
+def test_vanilla_name_alias_keeps_stattrak_and_finishes_distinct():
+    body = {'data': {'items': [
+        {'id': 1, 'market_hash_name': '★ StatTrak™ Survival Knife'},
+        {'id': 2, 'market_hash_name': '★ Survival Knife | Blue Steel (Field-Tested)'},
+        {'id': 3, 'market_hash_name': '★ Survival Knife'}]}}
+    assert match_goods(body, 'Survival Knife') == 3
+    assert match_goods(body, 'StatTrak™ Survival Knife') == 1
+    assert match_goods(body, 'Skeleton Knife') is None
+
+
+def test_goods_search_can_request_a_later_page():
+    session = Session()
+    BuffClient(session=session).search_goods('★ Survival Knife', page_size=50, page_num=2)
+    assert session.calls[0][1]['page_num'] == 2 and session.calls[0][1]['page_size'] == 50

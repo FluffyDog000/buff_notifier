@@ -1,8 +1,47 @@
 {% extends "base.html" %}{% block title %}Предметы{% endblock %}
 {% block body %}
+{% import 'list_controls.html' as controls with context %}
 <h1>Предметы</h1>
+<div class="card" data-selection>
+  <h2>Список предметов</h2>
+  <p class="muted">Все активные предметы проверяются по кругу с заданной паузой между запросами. Продажи в сутки показаны для справки и не влияют на очередь.</p>
+  {{ controls.filters(view, 'items', 'Название или goods_id') }}
+  {% if not watch %}<p class="muted">Предметов по этим условиям нет.</p>{% else %}
+  <form id="items-selection" data-bulk-form method="post" action="{{ url_for('items_selection') }}" class="bulk-toolbar">
+    <input type="hidden" name="csrf" value="{{ csrf }}">{{ controls.fields(view) }}
+    <label class="check"><input type="checkbox" data-select-all>Вся страница</label>
+    <span data-selected-count>Выбрано: 0</span>
+    <button class="ghost small" name="action" value="enable">Включить</button>
+    <button class="ghost small" name="action" value="disable">Выключить</button>
+    <button class="danger small" name="action" value="delete">Удалить выбранные</button>
+    <span class="help">«Вся страница» выбирает только показанные предметы.</span>
+  </form>
+  <div class="scroll"><table class="cards compact-list">
+    <tr><th class="select-cell"></th><th>Предмет</th><th>goods_id</th><th>Продаж / сутки</th><th>Опрос</th><th></th></tr>
+    {% for w in watch %}
+    <tr>
+      <td class="select-cell"><input type="checkbox" name="ids" value="{{ w.goods_id }}" form="items-selection" aria-label="Выбрать {{ w.name }}"></td>
+      <td class="title">{% if not w.active %}<span class="pill">выкл</span> {% endif %}<a href="{{ url(w.name) }}" target="_blank" rel="noopener">{{ w.name }}</a>
+        {% if w.last_error %}<div class="err muted">{{ w.last_error }}</div>{% endif %}</td>
+      <td data-label="goods_id">{{ w.goods_id }}</td>
+      <td data-label="Продаж в сутки">{{ '%.1f'|format(w.sales_per_day) if w.sales_per_day is not none else '—' }}</td>
+      <td class="muted" data-label="Опрос">был {{ ago(w.last_poll_at) }}{% if w.active %}; следующий — по очереди{% endif %}</td>
+      <td class="actions">
+        <form method="post" action="{{ url_for('items_toggle', gid=w.goods_id) }}" class="inline">
+          <input type="hidden" name="csrf" value="{{ csrf }}">{{ controls.fields(view) }}<button class="ghost small">{{ 'выкл' if w.active else 'вкл' }}</button></form>
+        <form method="post" action="{{ url_for('items_delete', gid=w.goods_id) }}" class="inline"
+              onsubmit='return confirm({{ ("Убрать " ~ w.name ~ "?")|tojson }})'>
+          <input type="hidden" name="csrf" value="{{ csrf }}">{{ controls.fields(view) }}<button class="danger small" aria-label="Удалить {{ w.name }}">×</button></form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table></div>
+  {{ controls.pages(view, 'items') }}
+  {% endif %}
+</div>
+
 <div class="card">
-  <h2>Подобрать из базы бота</h2>
+  <details class="section-fold"><summary>Подобрать предметы из базы</summary>
   <form method="get" action="{{ url_for('items') }}">
     <input type="hidden" name="pick" value="1">
     <div class="grid">
@@ -36,10 +75,10 @@
     </form>
     {% endif %}
   {% endif %}
-</div>
+</details></div>
 
 <div class="card">
-  <h2>Добавить</h2>
+  <details class="section-fold"><summary>Добавить предметы</summary>
   <form method="post" action="{{ url_for('items_add') }}">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label for="lines">По строке: название как в CSFloat-боте, <code>goods_id</code> или <code>goods_id;название</code></label>
@@ -53,7 +92,7 @@
     <pre>{% for n in names %}{{ n }}
 {% endfor %}</pre></details>
   {% endif %}
-</div>
+</details></div>
 
 {% if pending %}
 <div class="card">
@@ -62,41 +101,16 @@
     <tr><th>Предмет</th><th>Состояние</th><th></th></tr>
     {% for p in pending %}
     <tr><td class="title">{{ p.name }}</td>
-      <td data-label="Состояние" class="{{ 'err' if p.tries >= 3 }}">{% if p.tries == 0 %}в очереди{% elif p.tries < 3 %}попытка {{ p.tries }}: {{ p.error }}{% else %}не найден: {{ p.error }}{% endif %}</td>
+      <td data-label="Состояние" class="{{ 'err' if p.tries >= 3 }}">{% if p.tries >= 3 %}не найден: {{ p.error }}{% elif p.search_page > 1 %}{{ p.error }}{% elif p.tries == 0 %}в очереди{% else %}попытка {{ p.tries }}: {{ p.error }}{% endif %}</td>
       <td class="actions"><form method="post" action="{{ url_for('pending_remove') }}" class="inline">
         <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="name" value="{{ p.name }}">
         <button class="danger small">×</button></form></td></tr>
     {% endfor %}
   </table></div>
   <form method="post" action="{{ url_for('pending_remove') }}" class="row">
-    <input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost small">Убрать ненайденные</button>
+    <input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost small" formaction="{{ url_for('pending_retry') }}">Повторить поиск ненайденных</button><button class="ghost small">Убрать ненайденные</button>
   </form>
 </div>
 {% endif %}
 
-<div class="card">
-  <h2>Опрашиваются</h2>
-  <p class="muted">Все активные предметы проверяются по кругу с заданной паузой между запросами. Продажи в сутки показаны для справки и не влияют на очередь.</p>
-  {% if not watch %}<p class="muted">Список пуст.</p>{% else %}
-  <div class="scroll"><table class="cards">
-    <tr><th>Предмет</th><th>goods_id</th><th>Продаж в сутки</th><th>Опрос</th><th></th></tr>
-    {% for w in watch %}
-    <tr>
-      <td class="title">{% if not w.active %}<span class="pill">выкл</span> {% endif %}<a href="{{ url(w.name) }}" target="_blank" rel="noopener">{{ w.name }}</a>
-        {% if w.last_error %}<div class="err muted">{{ w.last_error }}</div>{% endif %}</td>
-      <td data-label="goods_id">{{ w.goods_id }}</td>
-      <td data-label="Продаж в сутки">{{ '%.1f'|format(w.sales_per_day) if w.sales_per_day is not none else '—' }}</td>
-      <td class="muted" data-label="Опрос">был {{ ago(w.last_poll_at) }}{% if w.active %}; следующий — по очереди{% endif %}</td>
-      <td class="actions">
-        <form method="post" action="{{ url_for('items_toggle', gid=w.goods_id) }}" class="inline">
-          <input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost small">{{ 'выкл' if w.active else 'вкл' }}</button></form>
-        <form method="post" action="{{ url_for('items_delete', gid=w.goods_id) }}" class="inline"
-              onsubmit='return confirm({{ ("Убрать " ~ w.name ~ "?")|tojson }})'>
-          <input type="hidden" name="csrf" value="{{ csrf }}"><button class="danger small">×</button></form>
-      </td>
-    </tr>
-    {% endfor %}
-  </table></div>
-  {% endif %}
-</div>
 {% endblock %}

@@ -281,3 +281,24 @@ class Accounts:
             raise ValueError("Основной аккаунт можно выключить, но нельзя удалить.")
         with LOCK:
             self._write([a for a in self._read() if a["id"] != aid])
+
+    def set_enabled(self, ids: list[str], enabled: bool) -> int:
+        with LOCK:
+            live = {a["id"]: a for a in self.list()}
+            selected = [live[i] for i in set(ids) if i in live]
+            if enabled and any(not a["BUFF_COOKIE"] or not a.get("egress_ip") for a in selected):
+                raise ValueError("Сначала проверьте сессию и IP всех выбранных аккаунтов.")
+            profiles = self._read()
+            changed = 0
+            for a in selected:
+                if a["enabled"] == enabled:
+                    continue
+                saved = next((p for p in profiles if p["id"] == a["id"]), None)
+                if saved is None:
+                    saved = {k: a[k] for k in ("id", "label", "interval")}
+                    profiles.insert(0, saved)
+                saved["enabled"] = enabled
+                changed += 1
+            if changed:
+                self._write(profiles)
+            return changed

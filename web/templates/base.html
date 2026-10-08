@@ -27,5 +27,7 @@
 {% endwith %}
 {% block body %}{% endblock %}
 </main>
+<script src="{{ url_for('static', filename='lists.js') }}" defer></script>
+{% if request.endpoint in ('settings_page', 'settings_save') %}<script src="{{ url_for('static', filename='settings.js') }}" defer></script>{% endif %}
 </body>
 </html>

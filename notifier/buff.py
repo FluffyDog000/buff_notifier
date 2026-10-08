@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 import requests
+from .names import canonical
 
 API = "https://api.buff.market"
 SELL_ORDER = "/api/market/goods/sell_order"
@@ -125,10 +126,10 @@ class BuffClient:
                                       "page_size": page_size, "goods_id": goods_id,
                                       "sort_by": sort_by})
 
-    def search_goods(self, query: str, page_size: int = 20) -> dict:
+    def search_goods(self, query: str, page_size: int = 20, page_num: int = 1) -> dict:
         """The market's item search: what the search box on buff.market asks.
         Same shape as Buff163's: data.items[] with `id` and `market_hash_name`."""
-        return self._get(SEARCH, {"game": "csgo", "page_num": 1, "page_size": page_size,
+        return self._get(SEARCH, {"game": "csgo", "page_num": page_num, "page_size": page_size,
                                   "search": query})
 
 
@@ -163,7 +164,7 @@ def proxy_display(url: str) -> str:
 def match_goods(body: dict, name: str) -> int | None:
     """The goods_id whose market_hash_name is exactly `name`, from a search answer."""
     for it in (body.get("data") or {}).get("items") or []:
-        if isinstance(it, dict) and it.get("market_hash_name") == name and it.get("id") is not None:
+        if isinstance(it, dict) and canonical(it.get("market_hash_name") or "") == canonical(name) and it.get("id") is not None:
             try:
                 return int(it["id"])
             except (TypeError, ValueError):

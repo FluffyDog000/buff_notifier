@@ -11,8 +11,10 @@ listing's own hundredth of float (`estimate`).
 
 Two signals:
 
-1. cheap - cost is below `net` by `min_discount` or more (and the profit
-   is at least `min_profit_usd`).
+1. cheap - cost is below the chosen median or its net proceeds by
+   `min_discount` or more. The reference can be the item, the float bucket,
+   their minimum (both conditions), or maximum (either condition). Both
+   minimum profit filters also apply. Unpainted knives use the item median.
 2. float - the listing's hundredth sells for `min_float_premium` more than
    a neighbouring hundredth, while the listing is priced like that ordinary
    neighbour (no more than `normal_tolerance` above its median) and still
@@ -30,6 +32,8 @@ from dataclasses import dataclass, field
 from . import phases
 from .estimate import BUCKET_MIN_SALES, ITEM_MIN_SALES, estimate
 from .listings import Listing
+from .localtime import moscow
+from .names import vanilla
 from .recency import choose_window, to_today, within
 
 # Read 45 days back: the longest window `choose_window` may settle on.
@@ -57,11 +61,15 @@ class Market:
     @classmethod
     def build(cls, sales: list[dict], window_days: float) -> "Market":
         window, _ = choose_window(sales, window_days, BUCKET_MIN_SALES, None)
+        if sales and all(r.get("float_value") is None for r in sales):
+            window = next((w for w in sorted({window_days, 30., 45.}) if w >= window_days
+                           and len(within(sales, w)) >= ITEM_MIN_SALES), 45.)
         rows, info = to_today(within(sales, window), window)
-        rows = [r for r in rows if r.get("price") and r.get("float_value") is not None]
+        rows = [r for r in rows if r.get("price")]
         m = cls(rows=rows, window=window, shift=info.shift if info.applied else None)
         for r in rows:
-            m.buckets.setdefault(_bucket(float(r["float_value"])), []).append(float(r["price"]))
+            if r.get("float_value") is not None:
+                m.buckets.setdefault(_bucket(float(r["float_value"])), []).append(float(r["price"]))
         return m
 
     def item_median(self) -> tuple[float | None, int]:
@@ -91,12 +99,15 @@ class Verdict:
     normal_lo: float | None = None
     premium: float | None = None
     pattern: bool = False
+    reference: str = ""                # brief explanation for the notification
+    discount: float | None = None
 
 
 def judge(listing: Listing, name: str, market: Market, s: dict) -> Verdict:
     if not listing.listed:
         return Verdict(None, "лот снят")
-    if listing.float_value is None:
+    unpainted = vanilla(name)
+    if listing.float_value is None and not unpainted:
         return Verdict(None, "нет float")
     _, phase_index = phases.split(name)
     if phase_index is not None and listing.paint_index != phase_index:
@@ -106,13 +117,19 @@ def judge(listing: Listing, name: str, market: Market, s: dict) -> Verdict:
         return Verdict(None, "паттерновый скин")
 
     cost = listing.price * s["usd_per_buff"] * (1 + s["buff_fee"])
-    lo = _bucket(listing.float_value)
+    lo = _bucket(listing.float_value) if listing.float_value is not None else None
     item_med, n_all = market.item_median()
-    b_med, n_b = market.bucket_median(lo)
-    band = f"{lo:.2f}–{lo + 0.01:.2f}"
+    b_med, n_b = market.bucket_median(lo) if lo is not None and not unpainted else (None, 0)
+    band = f"{lo:.2f}–{lo + 0.01:.2f}" if lo is not None else "—"
     mode = s.get("price_basis", "min")
 
-    if mode == "bucket":
+    if unpainted:
+        expected, basis = item_med, f"медиана {n_all} продаж ванильного ножа"
+    elif mode == "either":
+        choices = [(med, title) for med, title in ((b_med, f"float {band}"), (item_med, "весь предмет")) if med is not None]
+        expected, reference = max(choices, default=(None, ""), key=lambda x: x[0])
+        basis = f"медиана {reference} (любое из двух условий)"
+    elif mode == "bucket":
         expected, basis = estimate(market.rows, listing.float_value)
         if b_med is None and not s["allow_item_median"]:
             expected = None
@@ -134,9 +151,16 @@ def judge(listing: Listing, name: str, market: Market, s: dict) -> Verdict:
 
     net = expected * (1 - s["csfloat_fee"])
     profit = net - cost
+    reference = ("ванильный нож" if unpainted else reference if mode == "either" else
+                 "весь предмет" if mode == "item" or b_med is None else
+                 f"float {band}" if mode == "bucket" or b_med <= item_med else "весь предмет")
+    comparison = expected if s.get("discount_basis", "net") == "median" else net
+    discount = 1 - cost / comparison if comparison > 0 else 0
     v = Verdict(None, cost=cost, expected=expected, net=net, profit=profit,
-                profit_pct=profit / cost if cost else None, basis=basis + days, pattern=pattern)
-    if profit >= s["min_profit_usd"] and net > 0 and 1 - cost / net >= s["min_discount"]:
+                profit_pct=profit / cost if cost else None, basis=basis + days, pattern=pattern,
+                reference=f"{reference} · {market.window:g} дн.", discount=discount)
+    if (profit >= s["min_profit_usd"] and v.profit_pct >= s.get("min_profit_pct", 0)
+            and comparison > 0 and discount + 1e-12 >= s["min_discount"]):
         v.kind = "cheap"
         return v
 
@@ -154,33 +178,32 @@ def judge(listing: Listing, name: str, market: Market, s: dict) -> Verdict:
             b_net = b_med * (1 - s["csfloat_fee"])
             if (premium >= s["min_float_premium"] and cost <= normal * (1 + s["normal_tolerance"])
                     and b_net - cost >= s["min_profit_usd"]):
+                if (b_net - cost) / cost < s.get("min_profit_pct", 0):
+                    v.reason = "выгода ниже порога в процентах"
+                    return v
                 return Verdict("float", cost=cost, expected=b_med, net=b_net, profit=b_net - cost,
                                profit_pct=(b_net - cost) / cost, pattern=pattern,
                                basis=f"медиана {n_b} продаж в {band}" + days,
-                               normal=normal, normal_lo=nlo, premium=premium)
-    v.reason = (f"выгода ${profit:.2f}" if profit < s["min_profit_usd"]
-                else f"скидка {1 - cost / net:.0%}" if net > 0 else "нет оценки")
+                               normal=normal, normal_lo=nlo, premium=premium,
+                               reference=f"float {band} · {market.window:g} дн.")
+    v.reason = (f"выгода ${profit:.2f}" if profit < s["min_profit_usd"] else
+                "выгода ниже порога в процентах" if v.profit_pct < s.get("min_profit_pct", 0) else
+                f"скидка {discount:.0%}" if comparison > 0 else "нет оценки")
     return v
 
 
 def message(listing: Listing, name: str, v: Verdict, link: str) -> str:
-    head = "🟢 Дешевле рынка" if v.kind == "cheap" else "💎 Дорогой float по обычной цене"
+    head = "🟢 Дешевле рынка" if v.kind == "cheap" else "💎 Выгодный float"
     lines = [head, name]
     if v.pattern:
-        lines.append("⚠️ Паттерновый скин: цена зависит от паттерна, оценка по float грубая")
-    extra = f", наклейки: {', '.join(listing.stickers)}" if listing.stickers else ""
-    lines.append(f"Float {listing.float_value:.5f}, паттерн {listing.paint_seed}{extra}")
-    bargain = f" (торг от ${listing.bargain_floor:.2f})" if listing.bargain_floor else ""
-    lines.append(f"Цена на BuffMarket: ${listing.price:.2f}{bargain}"
-                 + (f", с комиссией ${v.cost:.2f}" if abs(v.cost - listing.price) > 0.005 else ""))
-    lines.append(f"Ожидаемо на CSFloat: ${v.expected:.2f}, после комиссии ${v.net:.2f}")
-    lines.append(f"Выгода: ${v.profit:.2f} ({v.profit_pct:.0%})")
-    lines.append(f"Оценка: {v.basis}")
-    if v.kind == "float" and v.normal is not None:
-        lines.append(f"Сотая {_bucket(listing.float_value):.2f} дороже соседней "
-                     f"{v.normal_lo:.2f} (${v.normal:.2f}) на {v.premium:.0%}")
+        lines.append(f"⚠️ Паттерновый скин · seed {listing.paint_seed}")
+    lines.append(f"💵 Buff: ${listing.price:.2f}" + (f" · скидка {v.discount:.0%}" if v.discount is not None else "")
+                 + (f" · затраты ${v.cost:.2f}" if abs(v.cost - listing.price) > .005 else ""))
+    lines.append(f"📊 CSFloat: ${v.expected:.2f} · {v.reference}")
+    lines.append(f"💰 Расчётная выгода: +${v.profit:.2f} ({v.profit_pct:+.1%})")
+    if listing.float_value is not None and not vanilla(name):
+        lines.append(f"🔬 Float {listing.float_value:.5f}")
     if listing.created_at:
-        lines.append(f"Выставлен {listing.created_at:%d.%m %H:%M} UTC")
-    lines.append(link)
-    lines.append(f"Лот {listing.id}")
+        lines.append(f"🕒 {moscow(listing.created_at):%d.%m %H:%M} МСК")
+    lines.append(f"🔗 {link}")
     return "\n".join(lines)

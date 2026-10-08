@@ -82,12 +82,34 @@ def test_a_cheap_listing_is_alerted_once(env):
     client = Client(page(lot(1, 80, 0.161), lot(2, 99, 0.162)), page(lot(1, 80, 0.161)))
     p = poller(env, client)
     p.cycle(NOW)
-    assert len(TG.sent) == 1 and "Лот L1" in TG.sent[0]
+    assert len(TG.sent) == 1 and "💵 Buff: $80.00" in TG.sent[0] and "МСК" in TG.sent[0]
     w = env[0].watch_list()[0]
     assert w["sales_per_day"] == 1.0 and w["interval_min"] == 0, "low sales do not delay scanning"
     p.cycle(NOW + timedelta(seconds=5))
     assert client.calls == [5777, 5777] and len(TG.sent) == 1
     assert env[0].recent_signals()[0]["sent"] == 1
+
+
+def test_vanilla_search_continues_to_exact_match_on_later_page(env):
+    store, s_path, envp = env
+    store.add_pending(['★ Survival Knife'])
+    class SearchClient:
+        calls = []
+        def search_goods(self, query, page_size, page_num):
+            self.calls.append((query, page_size, page_num))
+            if page_num == 1:
+                return {'data': {'total_page': 2, 'items': [{'id': 9, 'market_hash_name': '★ StatTrak™ Survival Knife'}]}}
+            return {'data': {'total_page': 2, 'items': [{'id': 8540, 'market_hash_name': '★ Survival Knife'}]}}
+    client = SearchClient()
+    p = poller(env, client)
+    s, sec = p.context()
+    p.resolve(store.next_pending(), s, sec, TG('', ''), NOW, 'cookie')
+    assert store.next_pending()['search_page'] == 2 and store.next_pending()['tries'] == 0
+    restarted = poller(env, client)
+    restarted.resolve(store.next_pending(), s, sec, TG('', ''), NOW + timedelta(seconds=5), 'cookie')
+    assert not store.pending_list()
+    assert any(w['goods_id'] == 8540 and w['name'] == '★ Survival Knife' for w in store.watch_list())
+    assert client.calls == [('★ Survival Knife', 50, 1), ('★ Survival Knife', 50, 2)]
 
 
 def test_all_items_are_scanned_without_waiting_for_old_timers_and_progress_survives_restart(env):

@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS pending (
     name          TEXT PRIMARY KEY,          -- CSFloat market_hash_name (phase name allowed)
     added_at      TEXT NOT NULL,
     tries         INTEGER NOT NULL DEFAULT 0,
+    search_page   INTEGER NOT NULL DEFAULT 1,
     error         TEXT                       -- why the last search found nothing
 );
 CREATE TABLE IF NOT EXISTS status (
@@ -123,6 +124,13 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         self.lock = threading.Lock()
+        if "search_page" not in {r[1] for r in self.conn.execute("PRAGMA table_info(pending)")}:
+            try:
+                self.conn.execute("ALTER TABLE pending ADD COLUMN search_page INTEGER NOT NULL DEFAULT 1")
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                if "search_page" not in {r[1] for r in self.conn.execute("PRAGMA table_info(pending)")}:
+                    raise
         if "account_id" not in {r[1] for r in self.conn.execute("PRAGMA table_info(measurements)")}:
             try:
                 self.conn.execute("ALTER TABLE measurements ADD COLUMN account_id TEXT NOT NULL DEFAULT 'primary'")
@@ -144,6 +152,17 @@ class Store:
     def remove_watch(self, goods_id: int) -> None:
         with self.lock, self.conn:
             self.conn.execute("DELETE FROM watch WHERE goods_id = ?", (goods_id,))
+
+    def edit_watch(self, ids: list[int], action: str) -> int:
+        """Apply one explicit action to the selected items in a transaction."""
+        with self.lock, self.conn:
+            before = self.conn.total_changes
+            if action == "delete":
+                self.conn.executemany("DELETE FROM watch WHERE goods_id = ?", [(i,) for i in ids])
+            else:
+                self.conn.executemany("UPDATE watch SET active = ? WHERE goods_id = ?",
+                                      [(int(action == "enable"), i) for i in ids])
+            return self.conn.total_changes - before
 
     def set_active(self, goods_id: int, active: bool) -> None:
         with self.lock, self.conn:
@@ -331,6 +350,19 @@ class Store:
         with self.lock, self.conn:
             self.conn.execute("UPDATE pending SET tries = tries + 1, error = ? WHERE name = ?",
                               (error, name))
+
+    def search_progress(self, name: str, page: int, exhausted: bool = False) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("UPDATE pending SET search_page = ?, tries = CASE WHEN ? THEN 3 ELSE tries END, "
+                              "error = ? WHERE name = ?", (page, exhausted,
+                              f"точное совпадение не найдено (страниц: {page})" if exhausted else f"проверяю страницу {page}", name))
+
+    def retry_pending(self, name: str | None = None) -> None:
+        with self.lock, self.conn:
+            if name:
+                self.conn.execute("UPDATE pending SET tries=0, search_page=1, error=NULL WHERE name=?", (name,))
+            else:
+                self.conn.execute("UPDATE pending SET tries=0, search_page=1, error=NULL WHERE tries>=3")
 
     def remove_pending(self, name: str | None = None) -> None:
         """One name, or (None) every name that has given up."""

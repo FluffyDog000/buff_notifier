@@ -55,3 +55,9 @@ def test_sales_carry_their_age_and_feed_the_estimate(db):
     today, _ = to_today(rows, 30)
     price, basis = estimate(today, 0.1551)
     assert price == pytest.approx(21.0, abs=0.5) and "0.15" in basis
+
+
+def test_vanilla_sales_can_include_missing_float(db):
+    conn = sales.connect(db)
+    rows = sales.sales_for(conn, 1, 30, NOW, include_missing_float=True)
+    assert len(rows) == 32 and any(r['float_value'] is None for r in rows)

@@ -1,13 +1,65 @@
 {% extends "base.html" %}{% block title %}Аккаунты{% endblock %}
 {% block body %}
-<h1>Аккаунты</h1>
-<div class="card">
-  <p>Аккаунты с отдельными адресами работают параллельно и разбирают общую очередь предметов. Один лот получает одно уведомление.</p>
-  <p class="muted">У каждого аккаунта своя сессия, пауза и статистика. Для одинакового исходящего IP действует общий темп и общая остановка после 429. Независимость лимитов разных аккаунтов и IP проверяется по фактическим результатам.</p>
-  <p class="muted">Новый аккаунт добавляется выключенным: «Войти через Steam» → автоматическое сохранение и проверка сессии → «Включить». Можно также вставить curl вручную. Основной аккаунт использует сессию из прежних настроек.</p>
+{% import 'list_controls.html' as controls with context %}
+<h1>Аккаунты <span class="pill">{{ enabled_count }} включено / {{ view.total }}</span></h1>
+<div class="card" data-selection>
+  {{ controls.filters(view, 'accounts_page', 'Название аккаунта, IP или адрес прокси') }}
+  <form id="accounts-selection" data-bulk-form method="post" action="{{ url_for('accounts_selection') }}" class="bulk-toolbar">
+    <input type="hidden" name="csrf" value="{{ csrf }}">{{ controls.fields(view) }}
+    <label class="check"><input type="checkbox" data-select-all>Вся страница</label>
+    <span data-selected-count>Выбрано: 0</span>
+    <button class="ghost small" name="action" value="enable">Включить выбранные</button>
+    <button class="ghost small" name="action" value="disable">Выключить выбранные</button>
+  </form>
+  {% if not accounts %}<p class="muted">Аккаунтов по этим условиям нет.</p>{% endif %}
+  <div class="scroll"><table class="cards compact-list">
+    <tr><th class="select-cell"></th><th>Аккаунт</th><th>Сессия / IP</th><th>За час</th><th>Действия</th></tr>
+    {% for a in accounts %}<tr>
+      <td class="select-cell"><input type="checkbox" name="ids" value="{{ a.id }}" form="accounts-selection" aria-label="Выбрать {{ a.label }}"></td>
+      <td class="title">{{ a.label }}<div><span class="pill {{ 'ok' if a.enabled }}">{{ 'включён' if a.enabled else 'выключен' }}</span><span class="muted"> · {{ a.interval }} с</span></div></td>
+      <td data-label="Сессия / IP"><div>{{ a.session_state }}</div><div class="muted">{{ a.ip or 'IP не проверен' }}</div>{% if a.pause_active %}<div class="warn muted">Пауза 429: {{ ago(a.pause_until) }}</div>{% endif %}</td>
+      <td data-label="За час">{% if a.metrics %}{{ a.metrics.hour.polls }} опросов<div class="muted">429: {{ a.metrics.hour.limited }}</div>{% else %}<span class="muted">Нет запросов</span>{% endif %}</td>
+      <td><div class="account-tools">
+        <form method="post" action="{{ url_for('accounts_toggle', aid=a.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}">{{ controls.fields(view) }}<button class="{{ 'danger' if a.enabled else 'ghost' }} small">{{ 'Выключить' if a.enabled else 'Включить' }}</button></form>
+        <details><summary>Управление</summary><div class="detail-body">
+          <p class="muted">{{ a.proxy or 'Адрес сервера' }} · Сессия {{ 'сохранена' if a.has_cookie else 'не задана' }}</p>
+          {% if a.metrics %}<p class="muted">Всего запросов: {{ a.metrics.attempts }} · 429: {{ a.metrics.limited }}{% if a.metrics.first_429_at %}<br>Первое 429 через {{ a.metrics.first_429_minutes|round(1) }} мин, до него {{ a.metrics.before_429 }} запросов{% endif %}</p>{% endif %}
+          <form method="post" action="{{ url_for('accounts_test', aid=a.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost small">Проверить сессию и IP</button></form>
+  <details class="row"><summary>Войти через Steam / обновить сессию автоматически</summary>
+    <form method="post" action="{{ url_for('accounts_login_start', aid=a.id) }}" style="width:100%">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label>Логин Steam<input type="text" name="username" autocomplete="off" maxlength="255"></label>
+      <label>Пароль Steam<input type="password" name="password" autocomplete="new-password" maxlength="512"></label>
+      <p class="help">Пароль используется только для текущего входа. Если оба поля пустые, откроется браузер для ручного входа или сохранённой авторизации. Используется прокси этого профиля.</p>
+      <button>Войти через Steam</button>
+    </form>
+  </details>
+
+  <details class="row"><summary>Изменить название, сессию, прокси или паузу</summary>
+  <form method="post" action="{{ url_for('accounts_save') }}" style="width:100%">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ a.id }}">
+    <label>Название<input type="text" name="label" value="{{ a.label }}" required maxlength="80"></label>
+    <label>Новый curl<textarea name="curl" autocomplete="off" placeholder="Пусто — оставить текущую сессию"></textarea></label>
+    <label>Новый постоянный прокси<input type="password" name="proxy" autocomplete="new-password" placeholder="Пусто — оставить текущий"></label>
+    <label class="check"><input type="checkbox" name="clear_proxy">Убрать прокси и использовать адрес сервера</label>
+    <label>Пауза между запросами, с<input type="number" name="interval" min="1" max="600" step="any" value="{{ a.interval }}"></label>
+    <button>Сохранить</button>
+  </form></details>
+
+          {% if a.id != 'primary' %}<form method="post" action="{{ url_for('accounts_remove', aid=a.id) }}" onsubmit="return confirm('Удалить этот профиль?')"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="danger small">Удалить профиль</button></form>{% endif %}
+        </div></details>
+      </div></td>
+    </tr>{% endfor %}
+  </table></div>
+  {{ controls.pages(view, 'accounts_page') }}
+  <p class="help">Отдельные IP работают параллельно. Аккаунты с одним IP разделяют темп запросов и паузу после 429.</p>
 </div>
+{% if batches %}<div class="card">
+  <h2>Последние массовые импорты</h2>
+  {% for b in batches|reverse %}<p><a href="{{ url_for('accounts_bulk', bid=b.id) }}">{{ 'Завершён' if b.done else 'В процессе' }}: {{ b.ok }} из {{ b.total }} готовы · ошибок {{ b.failed }}</a></p>{% endfor %}
+</div>{% endif %}
 <div class="card" id="bulk-import">
-  <h2>Массовое добавление аккаунтов и прокси</h2>
+  <details class="section-fold"><summary>Массовое добавление аккаунтов и прокси</summary>
   <form method="post" action="{{ url_for('accounts_bulk_start') }}" autocomplete="off">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label>Аккаунты Steam — по одному в строке<textarea name="accounts" required autocomplete="off" spellcheck="false" rows="7" placeholder="login1:password1&#10;login2:password2"></textarea></label>
@@ -21,50 +73,9 @@
     <p class="help">Пароли Steam остаются только в памяти до обработки или отмены. При выходе из панели или перезапуске службы очередь остановится; для продолжения вставьте список заново. Список паролей после отправки не показывается.</p>
     <button>Добавить и запустить массовый вход</button>
   </form>
-</div>
-{% if batches %}<div class="card">
-  <h2>Последние массовые импорты</h2>
-  {% for b in batches|reverse %}<p><a href="{{ url_for('accounts_bulk', bid=b.id) }}">{{ 'Завершён' if b.done else 'В процессе' }}: {{ b.ok }} из {{ b.total }} готовы · ошибок {{ b.failed }}</a></p>{% endfor %}
-</div>{% endif %}
-{% for a in accounts %}
+</details></div>
 <div class="card">
-  <h2>{{ a.label }} <span class="pill {{ 'ok' if a.enabled }}">{{ 'включён' if a.enabled else 'выключен' }}</span></h2>
-  <div class="grid">
-    <div>Сессия: {{ a.session_state }}<div class="muted">{{ 'сохранена' if a.has_cookie else 'не задана' }}</div></div>
-    <div>IP: {{ a.ip or 'не проверен' }}<div class="muted">{{ a.proxy or 'адрес сервера' }}</div></div>
-    <div>Пауза: {{ a.interval }} с{% if a.pause_until %}<div class="muted">Окончание последней паузы 429: {{ ago(a.pause_until) }}</div>{% endif %}</div>
-    {% if a.metrics %}<div>Запросы: {{ a.metrics.attempts }} · 429: {{ a.metrics.limited }}
-      <div class="muted">За последний час: {{ a.metrics.hour.polls }} опросов и {{ a.metrics.hour.searches }} поисков</div>
-      <div class="muted">{% if a.metrics.first_429_at %}Первое 429 через {{ a.metrics.first_429_minutes|round(1) }} мин, до него {{ a.metrics.before_429 }} запросов{% else %}В этом замере 429 ещё не было{% endif %}</div></div>{% endif %}
-  </div>
-  <details class="row"><summary>Войти через Steam / обновить сессию автоматически</summary>
-    <form method="post" action="{{ url_for('accounts_login_start', aid=a.id) }}" style="width:100%">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
-      <label>Логин Steam<input type="text" name="username" autocomplete="off" maxlength="255"></label>
-      <label>Пароль Steam<input type="password" name="password" autocomplete="new-password" maxlength="512"></label>
-      <p class="help">Пароль используется только для текущего входа. Если оба поля пустые, откроется браузер для ручного входа или сохранённой авторизации. Используется прокси этого профиля.</p>
-      <button>Войти через Steam</button>
-    </form>
-  </details>
-  <div class="row">
-    <form method="post" action="{{ url_for('accounts_test', aid=a.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost">Проверить сессию и IP</button></form>
-    <form method="post" action="{{ url_for('accounts_toggle', aid=a.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost">{{ 'Выключить' if a.enabled else 'Включить' }}</button></form>
-    {% if a.id != 'primary' %}<form method="post" action="{{ url_for('accounts_remove', aid=a.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="danger">Удалить профиль</button></form>{% endif %}
-  </div>
-  <details class="row"><summary>Изменить название, сессию, прокси или паузу</summary>
-  <form method="post" action="{{ url_for('accounts_save') }}" style="width:100%">
-    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ a.id }}">
-    <label>Название<input type="text" name="label" value="{{ a.label }}" required maxlength="80"></label>
-    <label>Новый curl<textarea name="curl" autocomplete="off" placeholder="Пусто — оставить текущую сессию"></textarea></label>
-    <label>Новый постоянный прокси<input type="password" name="proxy" autocomplete="new-password" placeholder="Пусто — оставить текущий"></label>
-    <label class="check"><input type="checkbox" name="clear_proxy">Убрать прокси и использовать адрес сервера</label>
-    <label>Пауза между запросами, с<input type="number" name="interval" min="1" max="600" step="any" value="{{ a.interval }}"></label>
-    <button>Сохранить</button>
-  </form></details>
-</div>
-{% endfor %}
-<div class="card">
-  <h2>Добавить аккаунт через Steam</h2>
+  <details class="section-fold"><summary>Добавить один аккаунт через Steam</summary>
   <form method="post" action="{{ url_for('accounts_login_new') }}">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label>Название<input type="text" name="label" required maxlength="80" placeholder="Аккаунт 2"></label>
@@ -75,9 +86,9 @@
     <p class="help">Бот откроет форму Steam и сохранит проверенную сессию BuffMarket. Пароль не записывается в базу. Один вход за раз; окно закроется через 10 минут. Без логина и пароля можно войти вручную в открытом браузере.</p>
     <button>Создать профиль и войти через Steam</button>
   </form>
-</div>
+</details></div>
 <div class="card">
-  <h2>Добавить аккаунт вручную через curl</h2>
+  <details class="section-fold"><summary>Добавить аккаунт через curl</summary>
   <form method="post" action="{{ url_for('accounts_save') }}">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label>Название<input type="text" name="label" required maxlength="80" placeholder="Аккаунт 2"></label>
@@ -86,5 +97,5 @@
     <label>Пауза между запросами, с<input type="number" name="interval" min="1" max="600" step="any" value="{{ default_interval }}"></label>
     <button>Сохранить выключенным</button>
   </form>
-</div>
+</details></div>
 {% endblock %}
