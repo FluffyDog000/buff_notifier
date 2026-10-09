@@ -1,5 +1,7 @@
 # Перенесено из csfloatpricesparcing/src/recency.py, коммит 4a7d61c, без изменений в логике.
 # Править там и переносить заново, а не расходиться молча.
+# Local extension: callers may bound trend sampling to reduce CPU on burstable
+# servers. The default and pricing formulas remain the upstream values.
 """Older sales brought to today's prices, a window as long as the item needs,
 and a resale price that owns up to how few sales it rests on.
 
@@ -130,11 +132,11 @@ def choose_window(sales, base: float, min_sample: int, span,
     return tried[-1], tried[-1] > base
 
 
-def _theil_sen(points: list[tuple[float, float]]) -> tuple[float, float]:
+def _theil_sen(points: list[tuple[float, float]], max_points: int = MAX_POINTS) -> tuple[float, float]:
     """(intercept at age 0, slope per day) of a line robust to outliers."""
-    if len(points) > MAX_POINTS:
-        stride = len(points) / MAX_POINTS
-        points = [points[int(i * stride)] for i in range(MAX_POINTS)]
+    if len(points) > max_points:
+        stride = len(points) / max_points
+        points = [points[int(i * stride)] for i in range(max_points)]
     slopes = []
     for i in range(len(points)):
         xi, yi = points[i]
@@ -147,7 +149,7 @@ def _theil_sen(points: list[tuple[float, float]]) -> tuple[float, float]:
     return a, b
 
 
-def level_line(rows):
+def level_line(rows, max_points: int = MAX_POINTS):
     """The item's float-neutral price level against age, and the last week's.
 
     Returns (intercept, slope, points, recent_median, recent_count) or None
@@ -170,17 +172,17 @@ def level_line(rows):
     if len(pts) < MIN_TREND:
         return None
     pts.sort()
-    a, b = _theil_sen(pts)
+    a, b = _theil_sen(pts, max_points)
     recent = [y for x, y in pts if x <= RECENT_DAYS]
     rec = st.median(recent) if len(recent) >= MIN_RECENT else None
     return a, b, len(pts), rec, len(recent)
 
 
-def to_today(rows, window: float) -> tuple[list[dict], Prepared]:
+def to_today(rows, window: float, max_points: int = MAX_POINTS) -> tuple[list[dict], Prepared]:
     """Copies of `rows` with each price brought to today's level; the original
     price kept as `raw_price`. Unchanged when no line can be drawn."""
     info = Prepared(window=window)
-    line = level_line(rows)
+    line = level_line(rows, max_points)
     if line is None:
         info.note = "мало продаж у предмета для линии цены — без пересчёта"
         return [dict(r, raw_price=r.get("price")) for r in rows], info

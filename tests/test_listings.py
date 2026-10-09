@@ -1,9 +1,9 @@
 """Listings read off a real answer (two listings of goods 24322, 07.10)."""
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from notifier.listings import item_url, parse_listing, parse_page
+from notifier.listings import fresh, item_url, parse_listing, parse_page
 
 SAMPLE = json.loads((Path(__file__).parent / "fixtures" / "sell_order_24322.json")
                     .read_text(encoding="utf-8"))
@@ -41,3 +41,15 @@ def test_the_item_page_link_matches_the_browsers():
     assert item_url("Desert Eagle | Mecha Industries (Minimal Wear)") == (
         "https://buff.market/market/goods/cs2/"
         "Desert%20Eagle%20%7C%20Mecha%20Industries%20%28Minimal%20Wear%29")
+
+
+def test_listing_age_uses_listing_time_and_handles_missing_or_future_dates():
+    x = parse_page(SAMPLE).listings[0]
+    now = x.created_at + timedelta(minutes=30)
+    assert fresh(x, now, 30), "the exact cutoff is inclusive"
+    assert not fresh(x, now + timedelta(seconds=1), 30)
+    assert fresh(x, now + timedelta(minutes=60), 120)
+    assert not fresh(x, x.created_at - timedelta(minutes=6), 30)
+    x.created_at = None
+    assert not fresh(x, now, 30)
+    assert fresh(x, now, 0), "zero explicitly disables the age restriction"

@@ -65,6 +65,19 @@ class Page:
     total: int | None
 
 
+def fresh(listing: Listing, now: datetime, max_minutes: float) -> bool:
+    """Only recent listings with a usable date; tolerate small clock skew."""
+    if max_minutes <= 0:
+        return True
+    if listing.created_at is None:
+        return False
+    created = listing.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age = (now - created).total_seconds()
+    return -300 <= age <= max_minutes * 60
+
+
 def _num(v, cast=float):
     try:
         return cast(v) if v not in (None, "") else None

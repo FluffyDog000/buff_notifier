@@ -197,18 +197,23 @@ def test_pattern_requires_five_close_float_sales_of_exact_seed():
 def test_window_extends_for_this_float_instead_of_a_more_liquid_hundredth():
     rows = sales({.08: 300.}, n=20)
     own = [dict(price=100., float_value=.165, age_days=age) for age in [1., 3., 18., 20., 25.]]
-    v = judge(lot(75., .165), NAME, Market.build(rows + own, 14), S)
-    assert v.kind == "cheap" and v.sample_count == 5 and "30 дн." in v.reference
+    market = Market.build(rows + own, 14)
+    model, matched = market.comparable(lot(75., .165), None, False, False)
+    assert model.window == 30 and len(matched) == 5
+    v = judge(lot(75., .165), NAME, market, S)
+    assert v.kind is None and "свежих похожих продаж 2/5" in v.reason
     old = [dict(r, age_days=31. + i) for i, r in enumerate(own)]
-    v = judge(lot(75., .165), NAME, Market.build(rows + old, 14), S)
-    assert v.kind == "cheap" and "45 дн." in v.reference and v.confidence == "низкая"
+    market = Market.build(rows + old, 14)
+    model, matched = market.comparable(lot(75., .165), None, False, False)
+    assert model.window == 45 and len(matched) == 5
+    assert judge(lot(75., .165), NAME, market, S).kind is None
     old[-1]["age_days"] = 46.
     assert judge(lot(75., .165), NAME, Market.build(rows + old, 14), S).expected is None
 
 
 def test_estimate_reserve_grows_with_spread_and_shrinking_sample():
     def sample(prices):
-        return PriceSample.build([dict(price=p, age_days=1.) for p in prices])
+        return PriceSample.build([dict(price=p, age_days=1.) for p in prices], percentile=.5)
     small = sample([80., 90., 100., 110., 120.])
     large = sample([80., 90., 100., 110., 120.] * 8)
     wide = sample([60., 80., 100., 120., 140.])
@@ -259,3 +264,44 @@ def test_legacy_price_settings_are_migrated_without_loosening_selection(tmp_path
     assert config.load_settings(path)["price_basis"] == "min"
     config.save_settings({"price_basis": "either"}, path)
     assert config.load_settings(path)["price_basis"] == "bucket"
+
+
+def test_old_expensive_sales_cannot_lift_price_above_recent_lower_quartile():
+    # P250: most of the fortnight's observations are older and dearer.
+    recent = [14.115,14.212,15.731,15.898,16.543]
+    rows = [dict(price=p,raw_price=p,age_days=1.,float_value=.068) for p in recent]
+    rows += [dict(price=21.,raw_price=21.,age_days=12.,float_value=.068)] * 18
+    sample = PriceSample.build(rows)
+    assert sample.median == 21. and sample.expected == pytest.approx(14.212)
+    assert sample.recent_count == 5
+    assert PriceSample.build(rows, percentile=.5).expected == pytest.approx(15.731)
+    rows = [dict(r,age_days=10.) for r in rows]
+    assert PriceSample.build(rows) is None, "plenty of old sales cannot substitute for fresh evidence"
+
+
+def test_recent_sale_minimum_applies_to_both_signals_and_the_neighbour():
+    own = sales({.15:120.}, n=8)
+    neighbours = sales({.16:100.}, n=8)
+    neighbours = [dict(r,age_days=10. if i >= 4 else r['age_days']) for i,r in enumerate(neighbours)]
+    market = Market.build(own + neighbours, 16)
+    assert judge(lot(101.,.1534),NAME,market,dict(S,cheap_signal=False)).kind is None
+    assert judge(lot(101.,.1534),NAME,market,dict(S,cheap_signal=False,min_recent_sales=4)).kind == 'float'
+    own = [dict(r,age_days=20.) for r in own]
+    assert judge(lot(10.,.1534),NAME,Market.build(own,16),S).kind is None
+
+
+def test_float_lookup_reuses_index_without_changing_boundaries_or_phase_matching():
+    rows = sales({.16:100.,.17:200.}, n=8)
+    market = Market.build(rows,16)
+    for f in (.16,.161,.164,.169,.17,.174):
+        expected = [r for r in rows if int(r['float_value']*100)==int(f*100)
+                    and abs(r['float_value']-f)<=.005+1e-12]
+        assert market.close_rows(f) == sorted(expected,key=lambda r:r['float_value'])
+
+
+def test_float_purchase_price_is_compared_to_recent_ordinary_prices():
+    own = [dict(price=140.,age_days=1.,float_value=.154)] * 5
+    neighbours = [dict(price=80.,age_days=1.,float_value=.164)] * 5
+    neighbours += [dict(price=100.,age_days=12.,float_value=.164)] * 10
+    v = judge(lot(90.,.154),NAME,Market.build(own+neighbours,16),dict(S,cheap_signal=False))
+    assert v.kind is None, "ordinary prices have fallen to 80; paying 90 is no longer ordinary"

@@ -78,6 +78,9 @@ def test_compact_lists_select_only_visible_rows_and_submit_actions(app):
         page.locator('input[name="cheap_signal"]').uncheck()
         assert 'Только «Выгодный float»' in page.locator('#signal-example').inner_text()
         assert page.locator('input[name="allow_item_median"]').count() == 0
+        assert page.locator('#max_listing_age_minutes').input_value() == '30'
+        assert page.locator('#min_recent_sales').input_value() == '5'
+        assert page.locator('#recent_price_percentile').input_value() == '25'
         page.screenshot(path=str(shots / 'settings-desktop.png'), full_page=True)
         page.goto(origin + '/items?per_page=25')
         page.screenshot(path=str(shots / 'items-desktop.png'), full_page=True)

@@ -16,7 +16,7 @@ if (settingsForm) {
     const profit = net - cost;
     const mode = settingsForm.elements.price_basis.value;
     const target = mode === 'min' ? 'по похожим продажам с ограничением ценой предмета' : 'по похожим продажам';
-    document.querySelector('#signal-example').textContent = `Пример ${target}: оценка после запаса на неопределённость $100 → затраты на покупку до $${cost.toFixed(2)} при скидке ${(discount * 100).toFixed(0)}%. После комиссии CSFloat остаётся $${net.toFixed(2)}; выгода $${profit.toFixed(2)} (${cost ? (profit / cost * 100).toFixed(1) : '—'}% от вложений). Нужны минимум 5 сопоставимых продаж. Дополнительно применяются оба порога выгоды ниже.`;
+    document.querySelector('#signal-example').textContent = `Пример ${target}: оценка после запаса на неопределённость и ограничения свежими продажами $100 → затраты на покупку до $${cost.toFixed(2)} при скидке ${(discount * 100).toFixed(0)}%. После комиссии CSFloat остаётся $${net.toFixed(2)}; выгода $${profit.toFixed(2)} (${cost ? (profit / cost * 100).toFixed(1) : '—'}% от вложений). Нужны минимум 5 сопоставимых продаж. Дополнительно применяются оба порога выгоды ниже.`;
   }
   settingsForm.addEventListener('input', example);
   settingsForm.addEventListener('change', example);

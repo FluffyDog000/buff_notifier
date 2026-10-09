@@ -27,7 +27,7 @@ from .names import vanilla
 from .localtime import moscow
 from .buff import BuffError, LoginRequired
 from .judge import HISTORY_DAYS, Market, judge, message
-from .listings import item_url, parse_page
+from .listings import fresh, item_url, parse_page
 from .store import Store, now_iso
 from .telegram import Telegram
 
@@ -204,6 +204,18 @@ class Poller:
         new = self.store.unseen(ids)
         gap = item["polls"] > 0 and len(ids) >= s["page_size"] and new == set(ids)
 
+        checked_at = self._request_finished_at or now
+        max_age = s.get("max_listing_age_minutes", 30.)
+        recent = [x for x in page.listings if fresh(x, checked_at, max_age)]
+        candidates = [x for x in recent if not self.store.signalled_listing(x, gid)]
+        if not candidates:
+            self.store.mark_seen(gid, ids, now)
+            self.store.polled(gid, now, 0, item.get("sales_per_day"))
+            self.store.set_status(f"valuation:{gid}",
+                                  f"Свежих лотов нет (лимит {max_age:g} мин.)"
+                                  if page.listings and not recent else None)
+            return 0.0
+
         item_id = sales.item_id(db, name)
         if item_id is None:
             self.store.mark_seen(gid, ids, now)
@@ -217,10 +229,10 @@ class Poller:
 
         sent = 0
         insufficient = 0
-        for x in page.listings:
+        for x in candidates:
             v = judge(x, name, market, s)
             insufficient += int(v.reason.startswith("недостаточно данных"))
-            if not v.kind or self.store.signalled(x.id):
+            if not v.kind:
                 continue
             text = message(x, name, v, item_url(name))
             sid = self.store.add_signal(dict(
@@ -233,7 +245,7 @@ class Poller:
                 sent += 1
         self.store.mark_seen(gid, ids, now)
         self.store.set_status(f"valuation:{gid}",
-                              f"Недостаточно похожих продаж: {insufficient} из {len(ids)} лотов"
+                              f"Недостаточно похожих продаж: {insufficient} из {len(candidates)} лотов"
                               if insufficient else None)
 
         self.store.polled(gid, now, 0, rate)

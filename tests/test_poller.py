@@ -15,7 +15,7 @@ NAME = "AK-47 | Redline (Field-Tested)"
 
 
 def lot(i, price, f):
-    return {"id": f"L{i}", "goods_id": 1, "price": str(price), "state": 1, "created_at": 1791377150,
+    return {"id": f"L{i}", "goods_id": 1, "price": str(price), "state": 1, "created_at": int(NOW.timestamp()) - 60,
             "asset_info": {"paintwear": str(f), "info": {"paintseed": i, "paintindex": 282}}}
 
 
@@ -100,7 +100,7 @@ def test_insufficient_similar_sales_are_reported_without_a_signal(env):
     assert len(TG.sent) == 1 and env[0].get_status("valuation:5777") is None
 
 
-def test_remote_listing_with_changing_suffix_is_alerted_once_across_restarts(env):
+def test_remote_listing_with_changing_suffix_is_alerted_once_across_restarts(env, monkeypatch):
     first = lot(190, 80, 0.161)
     first['id'] = '1094400227-18DF-136074490'
     second = dict(first, id='1094400227-18DF-137407458')
@@ -110,10 +110,34 @@ def test_remote_listing_with_changing_suffix_is_alerted_once_across_restarts(env
     # different full ID, but must claim the same notification identity.
     other = Store(env[0].conn.execute('PRAGMA database_list').fetchone()[2])
     try:
+        def should_not_reprice(*a, **kw):
+            raise AssertionError('an already alerted physical skin must not be repriced')
+        monkeypatch.setattr('notifier.poller.sales.sales_for', should_not_reprice)
         poller((other, env[1], env[2]), Client(page(second))).cycle(NOW + timedelta(seconds=5))
         assert len(TG.sent) == 1 and len(other.recent_signals()) == 1
     finally:
         other.conn.close()
+
+
+def test_old_listings_are_skipped_before_sales_and_price_calculations(env, monkeypatch):
+    raw = lot(1, 10, .161)
+    raw['created_at'] = int((NOW - timedelta(days=2)).timestamp())
+    def should_not_load(*a, **kw):
+        raise AssertionError('old listings must not load sales history')
+    monkeypatch.setattr('notifier.poller.sales.sales_for', should_not_load)
+    p = poller(env, Client(page(raw)))
+    p.cycle(NOW)
+    assert not TG.sent and env[0].get_status('valuation:5777') == 'Свежих лотов нет (лимит 30 мин.)'
+    assert env[0].watch_list()[0]['last_ok_at'] is not None
+
+
+def test_age_cutoff_can_be_changed_and_unknown_dates_are_not_alerted(env):
+    old = lot(1, 10, .161)
+    old['created_at'] = int((NOW - timedelta(minutes=90)).timestamp())
+    missing = dict(lot(2, 10, .161), created_at=None)
+    config.save_settings({'max_listing_age_minutes':120}, env[1])
+    poller(env, Client(page(old,missing))).cycle(NOW)
+    assert len(TG.sent) == 1
 
 
 def test_different_remote_skins_with_same_item_price_and_float_are_not_suppressed(env):

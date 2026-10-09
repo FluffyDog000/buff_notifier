@@ -90,3 +90,11 @@ def test_a_liquid_item_keeps_its_window_and_a_thin_one_gets_longer():
     assert extended and w in (30.0, 45.0)
 
 
+def test_bounded_trend_sampling_preserves_direction_and_price_on_a_liquid_market():
+    rows = _item(40.,60.,n=3000,days=30.)
+    fast, fast_info = recency.to_today(rows,30.,max_points=96)
+    original, original_info = recency.to_today(rows,30.)
+    assert fast_info.shift < 0 and original_info.shift < 0
+    assert all(a['price'] == pytest.approx(b['price'],rel=.01) for a,b in zip(fast,original))
+
+

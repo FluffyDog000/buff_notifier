@@ -14,7 +14,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from .listings import signal_key
+from .listings import Listing, signal_key
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS watch (
@@ -412,7 +412,13 @@ class Store:
 
     def signalled(self, listing_id: str) -> bool:
         return self.conn.execute("SELECT 1 FROM signals WHERE listing_id = ?",
-                                 (listing_id,)).fetchone() is not None
+                                (listing_id,)).fetchone() is not None
+
+    def signalled_listing(self, listing: Listing, goods_id: int | None = None) -> bool:
+        key = signal_key(listing.id, goods_id if goods_id is not None else listing.goods_id,
+                         listing.float_value, listing.paint_seed)
+        return self.conn.execute("SELECT 1 FROM signals WHERE dedup_key=? OR listing_id=?",
+                                 (key, listing.id)).fetchone() is not None
 
     def add_signal(self, sig: dict) -> int | None:
         """Row id, or None when this listing already had its one alert."""
