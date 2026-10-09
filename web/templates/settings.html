@@ -8,10 +8,10 @@
   <div class="card">
     <h2>{{ g }}</h2>
     {% if g == 'Сигналы' %}
-    <p>Сигнал приходит, если выполняется выбранное условие цены и фильтры минимальной выгоды. Все комиссии учитываются в расчёте выгоды.</p>
+    <p>Типы сигналов включаются независимо. Для каждого нужны похожие продажи и достаточная выгода после комиссий.</p>
     <div class="signal-example" id="signal-example" aria-live="polite"></div>
     {% endif %}
-    {% for f in fields if f.group == g %}
+    {% for f in fields if f.group == g and f.key != 'allow_item_median' %}
       {% if f.key == 'float_signal' %}<details class="section-fold row"><summary>Float и особые случаи</summary><div style="width:100%">{% endif %}
       {% if f.key == 'csfloat_db' %}<details class="section-fold row"><summary>Источник базы CSFloat</summary><div style="width:100%">{% endif %}
       {% if f.kind == 'bool' %}

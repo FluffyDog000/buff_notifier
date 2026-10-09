@@ -1,27 +1,8 @@
-"""Is a BuffMarket listing worth an alert?
+"""Price listings from comparable sales, with a conservative uncertainty reserve.
 
-The market is the CSFloat bot's sales history: the item's sales over a window
-long enough for its liquidity (16 days, or 30 / 45 for thin items, as the bot
-reads them), each brought to today's price level, then the median of the
-listing's own hundredth of float (`estimate`).
-
-    cost   = price on BuffMarket x rate x (1 + BuffMarket fee)
-    net    = median of the hundredth x (1 - CSFloat fee)
-    profit = net - cost
-
-Two signals:
-
-1. cheap - cost is below the chosen median or its net proceeds by
-   `min_discount` or more. The reference can be the item, the float bucket,
-   their minimum (both conditions), or maximum (either condition). Both
-   minimum profit filters also apply. Unpainted knives use the item median.
-2. float - the listing's hundredth sells for `min_float_premium` more than
-   a neighbouring hundredth, while the listing is priced like that ordinary
-   neighbour (no more than `normal_tolerance` above its median) and still
-   leaves `min_profit_usd`.
-
-Pattern skins (Fade, Marble Fade, Case Hardened, Heat Treated, Crimson Web) are priced by
-the seed, not the float: skipped, or alerted with a warning.
+At least five close-float sales are required, within the same phase and
+pattern seed where applicable. The whole-item price may cap an estimate,
+but never substitutes for missing comparable sales. Stickers are not valued.
 """
 from __future__ import annotations
 
@@ -30,13 +11,13 @@ import statistics
 from dataclasses import dataclass, field
 
 from . import phases
-from .estimate import BUCKET_MIN_SALES, ITEM_MIN_SALES, estimate
+from .estimate import BUCKET_MIN_SALES
 from .listings import Listing
 from .localtime import moscow
 from .names import vanilla
-from .recency import choose_window, to_today, within
+from .recency import careful_median, to_today, within
 
-# Read 45 days back: the longest window `choose_window` may settle on.
+# Read 45 days back: the longest comparable-sales window.
 HISTORY_DAYS = 45.0
 _PATTERN = re.compile(r"\| (Fade|Marble Fade|Case Hardened|Heat Treated|Crimson Web) \(")
 
@@ -52,37 +33,69 @@ def _bucket(f: float) -> float:
 
 @dataclass
 class Market:
-    """An item's sales, windowed and brought to today, ready to price floats."""
+    """Raw item history, with lazily prepared phase/seed/window models."""
     rows: list[dict]
     window: float
     shift: float | None = None          # level today vs window start, -0.03 = 3% down
-    buckets: dict[float, list[float]] = field(default_factory=dict)
+    base_window: float = 16.
+    prepared: dict = field(default_factory=dict, repr=False)
 
     @classmethod
     def build(cls, sales: list[dict], window_days: float) -> "Market":
-        window, _ = choose_window(sales, window_days, BUCKET_MIN_SALES, None)
-        if sales and all(r.get("float_value") is None for r in sales):
-            window = next((w for w in sorted({window_days, 30., 45.}) if w >= window_days
-                           and len(within(sales, w)) >= ITEM_MIN_SALES), 45.)
-        rows, info = to_today(within(sales, window), window)
-        rows = [r for r in rows if r.get("price")]
-        m = cls(rows=rows, window=window, shift=info.shift if info.applied else None)
-        for r in rows:
-            if r.get("float_value") is not None:
-                m.buckets.setdefault(_bucket(float(r["float_value"])), []).append(float(r["price"]))
-        return m
+        return cls(rows=sales, window=window_days, base_window=window_days)
 
-    def item_median(self) -> tuple[float | None, int]:
-        """The whole item's median: what a typical float sells for."""
-        if len(self.rows) < ITEM_MIN_SALES:
-            return None, len(self.rows)
-        return statistics.median(float(r["price"]) for r in self.rows), len(self.rows)
+    @staticmethod
+    def close_rows(rows: list[dict], f: float | None) -> list[dict]:
+        if f is None:
+            return rows
+        # Do not mix near-perfect floats with the far end of their hundredth.
+        radius = .001 if f < .01 or f >= .99 else .005
+        lo = _bucket(f)
+        return [r for r in rows if r.get("float_value") is not None
+                and _bucket(float(r["float_value"])) == lo
+                and abs(float(r["float_value"]) - f) <= radius + 1e-12]
 
-    def bucket_median(self, lo: float) -> tuple[float | None, int]:
-        prices = self.buckets.get(round(lo, 2), [])
-        if len(prices) < BUCKET_MIN_SALES:
-            return None, len(prices)
-        return statistics.median(prices), len(prices)
+    def comparable(self, listing: Listing, phase: int | None,
+                   pattern: bool, unpainted: bool) -> tuple["Market", list[dict]]:
+        eligible = [r for r in self.rows if (r.get("price") or 0) > 0
+                    and (phase is None or r.get("paint_index") == phase)
+                    and (not pattern or r.get("paint_seed") == listing.paint_seed)]
+        f = None if unpainted else listing.float_value
+        windows = sorted({self.base_window, 30., 45.})
+        windows = [w for w in windows if w >= self.base_window]
+        window = next((w for w in windows if len(self.close_rows(within(eligible, w), f))
+                       >= BUCKET_MIN_SALES), windows[-1])
+        # Trend fitting is shared across listings with the same phase/seed/window.
+        key = (phase, listing.paint_seed if pattern else None, window)
+        if key not in self.prepared:
+            rows, info = to_today(within(eligible, window), window)
+            self.prepared[key] = Market(rows, window, info.shift if info.applied else None,
+                                        base_window=window)
+        model = self.prepared[key]
+        return model, self.close_rows(model.rows, f)
+
+
+@dataclass(frozen=True)
+class PriceSample:
+    expected: float
+    median: float
+    count: int
+    confidence: str
+
+    @classmethod
+    def build(cls, rows: list[dict]) -> "PriceSample | None":
+        if len(rows) < BUCKET_MIN_SALES:
+            return None
+        prices = [float(r["price"]) for r in rows]
+        median = statistics.median(prices)
+        mad = statistics.median(abs(p - median) for p in prices)
+        recent = sum(1 for r in rows if r.get("age_days") is not None and 0 <= r["age_days"] <= 7)
+        # A quality label, not a calibrated probability of a future sale.
+        confidence = ("низкая" if len(rows) < 10 or recent < 3 or mad / median > .15
+                      else "высокая" if len(rows) >= 30 and recent >= 10 and mad / median <= .1
+                      else "средняя")
+        expected, _ = careful_median(prices, k=1.5 if confidence == "низкая" else 1.)
+        return cls(max(0., expected), median, len(rows), confidence)
 
 
 @dataclass
@@ -90,7 +103,7 @@ class Verdict:
     kind: str | None                    # cheap | float | None
     reason: str = ""                    # why not, when kind is None
     cost: float | None = None
-    expected: float | None = None       # CSFloat median the listing is priced by
+    expected: float | None = None       # conservative CSFloat sale-price estimate
     net: float | None = None
     profit: float | None = None
     profit_pct: float | None = None
@@ -101,6 +114,9 @@ class Verdict:
     pattern: bool = False
     reference: str = ""                # brief explanation for the notification
     discount: float | None = None
+    sample_count: int = 0
+    confidence: str = ""
+    raw_median: float | None = None
 
 
 def judge(listing: Listing, name: str, market: Market, s: dict) -> Verdict:
@@ -115,51 +131,56 @@ def judge(listing: Listing, name: str, market: Market, s: dict) -> Verdict:
     pattern = is_pattern_skin(name)
     if pattern and s["pattern_skins"] == "skip":
         return Verdict(None, "паттерновый скин")
+    if "Doppler" in name:
+        phase_index = phase_index or listing.paint_index
+        if phase_index is None:
+            return Verdict(None, "недостаточно данных: неизвестна фаза")
+    if pattern and listing.paint_seed is None:
+        return Verdict(None, "недостаточно данных: неизвестен seed")
 
     cost = listing.price * s["usd_per_buff"] * (1 + s["buff_fee"])
     lo = _bucket(listing.float_value) if listing.float_value is not None else None
-    item_med, n_all = market.item_median()
-    b_med, n_b = market.bucket_median(lo) if lo is not None and not unpainted else (None, 0)
+    market, comparable = market.comparable(listing, phase_index, pattern, unpainted)
+    sample = PriceSample.build(comparable)
     band = f"{lo:.2f}–{lo + 0.01:.2f}" if lo is not None else "—"
     mode = s.get("price_basis", "min")
 
-    if unpainted:
-        expected, basis = item_med, f"медиана {n_all} продаж ванильного ножа"
-    elif mode == "either":
-        choices = [(med, title) for med, title in ((b_med, f"float {band}"), (item_med, "весь предмет")) if med is not None]
-        expected, reference = max(choices, default=(None, ""), key=lambda x: x[0])
-        basis = f"медиана {reference} (любое из двух условий)"
-    elif mode == "bucket":
-        expected, basis = estimate(market.rows, listing.float_value)
-        if b_med is None and not s["allow_item_median"]:
-            expected = None
-    elif mode == "item":
-        expected, basis = item_med, f"медиана {n_all} продаж предмета"
-    elif b_med is not None and item_med is not None:
-        expected = min(b_med, item_med)
-        basis = (f"меньшая из медиан: сотая {band} — ${b_med:.2f} ({n_b} продаж), "
-                 f"предмет — ${item_med:.2f} ({n_all} продаж)")
-    elif s["allow_item_median"]:
-        expected, basis = item_med, f"медиана {n_all} продаж предмета (в сотой {band} мало продаж)"
-    else:
-        expected, basis = None, ""
-    if expected is None:
-        return Verdict(None, f"мало продаж в сотой {band} ({n_b})", cost=cost)
+    if sample is None:
+        return Verdict(None, f"недостаточно данных: мало продаж похожих лотов ({len(comparable)}/5) "
+                       f"в {band} за {market.window:g} дн.", cost=cost,
+                       sample_count=len(comparable))
+    b_med = None if unpainted else sample.expected
+    expected = sample.expected
+    reference = "ванильный нож" if unpainted else f"float {band}"
+    basis = (f"{reference}: {sample.count} похожих продаж, медиана ${sample.median:.2f}, "
+             f"оценка с резервом ${sample.expected:.2f}; надёжность {sample.confidence}")
+    if phase_index is not None:
+        basis += f"; paint index {phase_index}"
+    if pattern:
+        basis += f"; seed {listing.paint_seed}"
+    float_basis = basis
+    # Legacy 'item' and 'either' settings also require comparable sales.
+    # A whole-item estimate is only an additional conservative cap.
+    if not unpainted and mode in ("min", "item"):
+        whole = PriceSample.build(market.rows)
+        if whole is not None and whole.median < expected:
+            expected = whole.median
+            basis += f"; ограничено ценой предмета ${expected:.2f}"
+    if expected <= 0:
+        return Verdict(None, "недостаточно данных: слишком большой разброс цен", cost=cost)
     days = f" за {market.window:g} дн."
     if market.shift is not None and abs(market.shift) >= 0.005:
         days += f", цены приведены к сегодняшним ({market.shift:+.0%} за окно)"
 
     net = expected * (1 - s["csfloat_fee"])
     profit = net - cost
-    reference = ("ванильный нож" if unpainted else reference if mode == "either" else
-                 "весь предмет" if mode == "item" or b_med is None else
-                 f"float {band}" if mode == "bucket" or b_med <= item_med else "весь предмет")
     comparison = expected if s.get("discount_basis", "net") == "median" else net
     discount = 1 - cost / comparison if comparison > 0 else 0
     v = Verdict(None, cost=cost, expected=expected, net=net, profit=profit,
                 profit_pct=profit / cost if cost else None, basis=basis + days, pattern=pattern,
-                reference=f"{reference} · {market.window:g} дн.", discount=discount)
-    if (profit >= s["min_profit_usd"] and v.profit_pct >= s.get("min_profit_pct", 0)
+                reference=f"{reference} · {market.window:g} дн.", discount=discount,
+                sample_count=sample.count, confidence=sample.confidence, raw_median=sample.median)
+    if (s.get("cheap_signal", True) and profit >= s["min_profit_usd"] and v.profit_pct >= s.get("min_profit_pct", 0)
             and comparison > 0 and discount + 1e-12 >= s["min_discount"]):
         v.kind = "cheap"
         return v
@@ -169,7 +190,8 @@ def judge(listing: Listing, name: str, market: Market, s: dict) -> Verdict:
     if s["float_signal"] and b_med is not None:
         best = None
         for nlo in (round(lo - 0.01, 2), round(lo + 0.01, 2)):
-            med, _ = market.bucket_median(nlo)
+            neighbour = Market.close_rows(market.rows, round(listing.float_value + nlo - lo, 10))
+            med = statistics.median(r["price"] for r in neighbour) if len(neighbour) >= BUCKET_MIN_SALES else None
             if med and (best is None or med < best[0]):
                 best = (med, nlo)
         if best:
@@ -183,11 +205,13 @@ def judge(listing: Listing, name: str, market: Market, s: dict) -> Verdict:
                     return v
                 return Verdict("float", cost=cost, expected=b_med, net=b_net, profit=b_net - cost,
                                profit_pct=(b_net - cost) / cost, pattern=pattern,
-                               basis=f"медиана {n_b} продаж в {band}" + days,
+                               basis=float_basis + days + f"; соседняя сотая {nlo:.2f} — ${normal:.2f}",
                                normal=normal, normal_lo=nlo, premium=premium,
-                               reference=f"float {band} · {market.window:g} дн.")
+                               reference=f"float {band} · {market.window:g} дн.",
+                               sample_count=sample.count, confidence=sample.confidence, raw_median=sample.median)
     v.reason = (f"выгода ${profit:.2f}" if profit < s["min_profit_usd"] else
                 "выгода ниже порога в процентах" if v.profit_pct < s.get("min_profit_pct", 0) else
+                "сигнал дешевле рынка выключен" if not s.get("cheap_signal", True) else
                 f"скидка {discount:.0%}" if comparison > 0 else "нет оценки")
     return v
 
@@ -199,7 +223,7 @@ def message(listing: Listing, name: str, v: Verdict, link: str) -> str:
         lines.append(f"⚠️ Паттерновый скин · seed {listing.paint_seed}")
     lines.append(f"💵 Buff: ${listing.price:.2f}" + (f" · скидка {v.discount:.0%}" if v.discount is not None else "")
                  + (f" · затраты ${v.cost:.2f}" if abs(v.cost - listing.price) > .005 else ""))
-    lines.append(f"📊 CSFloat: ${v.expected:.2f} · {v.reference}")
+    lines.append(f"📊 CSFloat: ≈${v.expected:.2f} · {v.reference} · {v.sample_count} продаж · {v.confidence}")
     lines.append(f"💰 Расчётная выгода: +${v.profit:.2f} ({v.profit_pct:+.1%})")
     if listing.float_value is not None and not vanilla(name):
         lines.append(f"🔬 Float {listing.float_value:.5f}")

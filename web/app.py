@@ -468,6 +468,8 @@ def create_app(store_path: Path = config.STORE_PATH, settings_path: Path = confi
             except (ValueError, sqlite3.Error) as e:
                 flash(f"Не подобрал: {e}", "error")
         shown, view = list_view(store.watch_list(), request.args)
+        for item in shown:
+            item["valuation"] = store.get_status(f"valuation:{item['goods_id']}")
         return render_template("items.html", watch=shown, view=view, names=csfloat_names(s),
                                pending=store.pending_list(), picked=picked, pick=pick_args,
                                url=item_url)

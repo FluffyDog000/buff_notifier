@@ -22,7 +22,8 @@
     <tr>
       <td class="select-cell"><input type="checkbox" name="ids" value="{{ w.goods_id }}" form="items-selection" aria-label="Выбрать {{ w.name }}"></td>
       <td class="title">{% if not w.active %}<span class="pill">выкл</span> {% endif %}<a href="{{ url(w.name) }}" target="_blank" rel="noopener">{{ w.name }}</a>
-        {% if w.last_error %}<div class="err muted">{{ w.last_error }}</div>{% endif %}</td>
+        {% if w.last_error %}<div class="err muted">{{ w.last_error }}</div>{% endif %}
+        {% if w.valuation %}<div class="muted">{{ w.valuation }}</div>{% endif %}</td>
       <td data-label="goods_id">{{ w.goods_id }}</td>
       <td data-label="Продаж в сутки">{{ '%.1f'|format(w.sales_per_day) if w.sales_per_day is not none else '—' }}</td>
       <td class="muted" data-label="Опрос">был {{ ago(w.last_poll_at) }}{% if w.active %}; следующий — по очереди{% endif %}</td>

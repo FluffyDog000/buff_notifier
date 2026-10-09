@@ -129,6 +129,8 @@ def test_settings_are_saved_as_typed_and_checked(app):
     s = config.load_settings(app.tmp / "settings.json")
     assert s["min_discount"] == 0.2 and s["request_interval"] == 6.0
     assert s["float_signal"] is True and s["allow_item_median"] is False and s["paused"] is False
+    assert s["cheap_signal"] is False, "missing checkbox switches off cheap alerts independently"
+    assert 'name="cheap_signal"' in c.get('/settings').get_data(as_text=True)
     bad = dict(form, min_discount="abc")
     r = c.post("/settings", data=bad)
     assert r.status_code == 400 and "не число" in r.get_data(as_text=True)
@@ -142,6 +144,16 @@ def test_overview_items_and_settings_explain_continuous_scanning(app):
     body = c.get("/settings").get_data(as_text=True)
     assert 'name="poll_scale"' not in body and 'name="poll_max_minutes"' not in body
     assert "Опрос идёт непрерывно по кругу" in body
+
+
+def test_items_explain_missing_comparable_sales_separately_from_network_errors(app):
+    store = Store(app.tmp / 'buff.db')
+    store.add_watch(24322, NAME)
+    store.set_status('valuation:24322', 'Недостаточно похожих продаж: 2 из 10 лотов')
+    body = logged_in(app).get('/items').get_data(as_text=True)
+    assert 'Недостаточно похожих продаж: 2 из 10 лотов' in body
+    assert store.watch_list()[0]['last_error'] is None
+    store.conn.close()
 
 
 def test_the_session_comes_from_curl_and_never_back_to_the_page(app):

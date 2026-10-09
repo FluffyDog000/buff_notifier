@@ -216,11 +216,11 @@ class Poller:
         market = Market.build(rows, s["window_days"])
 
         sent = 0
+        insufficient = 0
         for x in page.listings:
-            if self.store.signalled(x.id):
-                continue
             v = judge(x, name, market, s)
-            if not v.kind:
+            insufficient += int(v.reason.startswith("недостаточно данных"))
+            if not v.kind or self.store.signalled(x.id):
                 continue
             text = message(x, name, v, item_url(name))
             sid = self.store.add_signal(dict(
@@ -232,6 +232,9 @@ class Poller:
                 self.store.mark_sent(sid)
                 sent += 1
         self.store.mark_seen(gid, ids, now)
+        self.store.set_status(f"valuation:{gid}",
+                              f"Недостаточно похожих продаж: {insufficient} из {len(ids)} лотов"
+                              if insufficient else None)
 
         self.store.polled(gid, now, 0, rate)
         if gap:

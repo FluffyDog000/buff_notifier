@@ -1,8 +1,10 @@
 """Which listings make an alert."""
 from datetime import datetime, timezone
 
+import pytest
+
 from notifier import config
-from notifier.judge import Market, is_pattern_skin, judge, message
+from notifier.judge import Market, PriceSample, is_pattern_skin, judge, message
 from notifier.listings import Listing
 
 S = config.defaults()
@@ -14,7 +16,8 @@ def sales(bucket_prices: dict[float, float], n: int = 8) -> list[dict]:
     rows = []
     for lo, price in bucket_prices.items():
         for i in range(n):
-            rows.append({"price": price, "float_value": lo + 0.004, "age_days": 1.0 + i})
+            rows.append({"price": price, "float_value": lo + 0.004, "age_days": 1.0 + i,
+                         "paint_seed": 1})
     return rows
 
 
@@ -59,7 +62,7 @@ def test_a_premium_float_at_a_premium_price_is_not():
 def test_without_five_sales_in_the_hundredth_there_is_no_estimate_by_default():
     v = judge(lot(10.0, 0.4512), NAME, MARKET, S)
     assert v.kind is None and "мало продаж" in v.reason
-    assert judge(lot(10.0, 0.4512), NAME, MARKET, dict(S, allow_item_median=True)).kind == "cheap"
+    assert judge(lot(10.0, 0.4512), NAME, MARKET, dict(S, allow_item_median=True)).kind is None
 
 
 def test_pattern_skins_are_skipped_or_flagged():
@@ -89,15 +92,15 @@ def test_the_message_is_compact_and_uses_moscow_time():
     assert "08.10 02:30 МСК" in message(x, NAME, judge(x, NAME, MARKET, S), 'https://x')
 
 
-def test_either_median_accepts_one_discount_while_min_requires_both():
+def test_legacy_either_mode_requires_similar_sales_while_min_also_caps_price():
     market = Market.build(sales({.15: 120., .16: 100., .17: 98.}), 16)
     s = dict(S, price_basis="either", discount_basis="median", min_discount=.2, float_signal=False)
     v = judge(lot(95., .155), NAME, market, s)
     assert v.kind == "cheap" and v.expected == 120. and "float" in v.reference
     assert judge(lot(95., .155), NAME, market, dict(s, price_basis="min")).kind is None
-    # A cheap item also works with no five-sale sample in its hundredth.
+    # The legacy mode can no longer bypass the comparable sample requirement.
     v = judge(lot(80., .455), NAME, market, s)
-    assert v.kind == "cheap" and v.expected == 100. and "весь предмет" in v.reference
+    assert v.kind is None and "недостаточно данных" in v.reason
 
 
 def test_discount_and_return_are_distinct_and_boundary_is_inclusive():
@@ -133,8 +136,9 @@ def test_a_thin_hundredth_inflated_by_rare_sales_is_held_to_the_item_median():
     v = judge(x, name, m, dict(S, min_profit_usd=0.5))
     assert v.kind is None and v.expected == 2.59
     assert judge(x, name, m, dict(S, min_profit_usd=0.5, price_basis="item")).kind is None
-    assert judge(x, name, m, dict(S, min_profit_usd=0.5, price_basis="bucket")).kind == "cheap", \
-        "the old reading, kept as a choice"
+    conservative = judge(x, name, m, dict(S, min_profit_usd=0.5, price_basis="bucket"))
+    assert conservative.kind is None and conservative.expected < 5.3, \
+        "uncertainty in a small noisy sample must reduce its apparent profit"
 
 
 def test_a_worse_float_is_not_cheap_against_the_item_median():
@@ -144,3 +148,114 @@ def test_a_worse_float_is_not_cheap_against_the_item_median():
 
 def test_heat_treated_is_a_pattern_skin():
     assert is_pattern_skin("Five-SeveN | Heat Treated (Field-Tested)")
+
+
+@pytest.mark.parametrize("mode", ["min", "bucket", "either", "item"])
+def test_awp_sparse_float_never_borrows_expensive_better_float_sales(mode):
+    rows = sales({.08: 45.5}, n=20)
+    rows += [dict(price=p, float_value=f, age_days=2.) for p, f in
+             zip([31.83, 31.89, 33.15, 34.02], [.1343, .1361, .1388, .1365])]
+    v = judge(lot(35.07, .13569), "AWP | Chromatic Aberration (Minimal Wear)",
+              Market.build(rows, 14), dict(S, price_basis=mode, allow_item_median=True))
+    assert v.kind is None and v.expected is None and v.sample_count == 4
+    assert "недостаточно данных" in v.reason
+
+
+def test_float_matches_are_close_even_within_one_hundredth():
+    m = Market.build(sales({.16: 100.}, n=10), 14)
+    # .164 is in the same hundredth as .1699, but too far away to compare.
+    assert judge(lot(50., .1699), NAME, m, S).expected is None
+    assert judge(lot(50., .165), NAME, m, S).expected == 100.
+    perfect = Market.build([dict(r, float_value=.009) for r in sales({.0: 100.}, n=10)], 14)
+    assert judge(lot(50., .0002), NAME, perfect, S).expected is None
+
+
+@pytest.mark.parametrize("name", ["★ Bayonet | Doppler (Factory New)",
+                                 "★ Bayonet | Doppler Phase 2 (Factory New)"])
+def test_phase_sales_are_never_mixed(name):
+    own = [dict(r, paint_index=419) for r in sales({.0: 100.}, n=5)]
+    other = [dict(r, paint_index=415) for r in sales({.0: 500.}, n=20)]
+    v = judge(lot(75., .004, idx=419), name, Market.build(own + other, 14), S)
+    assert v.kind == "cheap" and v.expected == 100. and v.sample_count == 5
+    m = Market.build(own[:4] + other, 14)
+    assert judge(lot(75., .004, idx=419), name, m, S).expected is None
+    assert "неизвестна фаза" in judge(lot(75., .004), "★ Bayonet | Doppler (Factory New)", m, S).reason
+
+
+def test_pattern_requires_five_close_float_sales_of_exact_seed():
+    name = "★ Bayonet | Case Hardened (Field-Tested)"
+    s = dict(S, pattern_skins="notify")
+    own = sales({.16: 100.}, n=5)
+    other = [dict(r, paint_seed=2) for r in sales({.16: 1000.}, n=20)]
+    v = judge(lot(75., .165), name, Market.build(own + other, 14), s)
+    assert v.kind == "cheap" and v.expected == 100. and v.sample_count == 5
+    assert "seed 1" in v.basis
+    assert judge(lot(75., .165), name, Market.build(own[:4] + other, 14), s).expected is None
+    assert "неизвестен seed" in judge(lot(75., .165, seed=None), name, MARKET, s).reason
+
+
+def test_window_extends_for_this_float_instead_of_a_more_liquid_hundredth():
+    rows = sales({.08: 300.}, n=20)
+    own = [dict(price=100., float_value=.165, age_days=age) for age in [1., 3., 18., 20., 25.]]
+    v = judge(lot(75., .165), NAME, Market.build(rows + own, 14), S)
+    assert v.kind == "cheap" and v.sample_count == 5 and "30 дн." in v.reference
+    old = [dict(r, age_days=31. + i) for i, r in enumerate(own)]
+    v = judge(lot(75., .165), NAME, Market.build(rows + old, 14), S)
+    assert v.kind == "cheap" and "45 дн." in v.reference and v.confidence == "низкая"
+    old[-1]["age_days"] = 46.
+    assert judge(lot(75., .165), NAME, Market.build(rows + old, 14), S).expected is None
+
+
+def test_estimate_reserve_grows_with_spread_and_shrinking_sample():
+    def sample(prices):
+        return PriceSample.build([dict(price=p, age_days=1.) for p in prices])
+    small = sample([80., 90., 100., 110., 120.])
+    large = sample([80., 90., 100., 110., 120.] * 8)
+    wide = sample([60., 80., 100., 120., 140.])
+    assert small.median == large.median == wide.median == 100.
+    assert 0 < wide.expected < small.expected < large.expected < 100.
+    assert small.confidence == "низкая" and large.confidence == "высокая"
+    assert sample([100.] * 8).expected == 100.
+    assert sample([100.] * 8 + [10000.]).expected == 100., "one expensive sale must not inflate the estimate"
+
+
+def test_noisy_mp9_sample_cannot_use_unadjusted_median_for_profit():
+    prices = [8.87, 9.68, 10.35, 10.71, 11.85, 12.82]
+    rows = [dict(price=p, float_value=.264, age_days=1.) for p in prices]
+    v = judge(lot(8.39, .26365), "MP9 | Latte Rush (Field-Tested)", Market.build(rows, 14),
+              dict(S, buff_fee=.01, min_profit_pct=.15, price_basis="bucket"))
+    assert v.kind is None and v.raw_median == pytest.approx(10.53)
+    assert v.expected < 9.5 and v.profit_pct < .15
+
+
+def test_neighbour_premium_uses_conservative_price_and_same_phase():
+    name = "★ Bayonet | Doppler (Factory New)"
+    rows = [dict(r, paint_index=419) for r in sales({.15: 120.}, n=8)]
+    rows += [dict(r, paint_index=415) for r in sales({.16: 80.}, n=8)]
+    assert judge(lot(80., .154, idx=419), name, Market.build(rows, 16),
+                 dict(S, min_discount=.5)).kind is None
+
+
+def test_stickers_do_not_add_a_premium_or_change_the_comparable_selection():
+    plain = judge(lot(80., .165), NAME, MARKET, S)
+    stickered = judge(lot(80., .165, stickers=["Expensive"], sticker_premium=1000.), NAME, MARKET, S)
+    assert plain.expected == stickered.expected and plain.sample_count == stickered.sample_count
+
+
+def test_float_only_mode_suppresses_cheap_alerts_but_keeps_float_opportunities():
+    s = dict(S, cheap_signal=False)
+    cheap = judge(lot(80., .165), NAME, MARKET, s)
+    assert cheap.kind is None and "выключен" in cheap.reason
+    assert judge(lot(101., .1534), NAME, MARKET, s).kind == "float"
+    # Even a deep discount must be labelled as a float opportunity in this mode.
+    assert judge(lot(50., .1534), NAME, MARKET, s).kind == "float"
+    assert judge(lot(75., None), "★ Survival Knife",
+                 Market.build([dict(price=100., float_value=None, age_days=1.)] * 5, 14), s).kind is None
+
+
+def test_legacy_price_settings_are_migrated_without_loosening_selection(tmp_path):
+    path = tmp_path / "settings.json"
+    assert config.save_settings({"price_basis": "item"}, path)["price_basis"] == "item"
+    assert config.load_settings(path)["price_basis"] == "min"
+    config.save_settings({"price_basis": "either"}, path)
+    assert config.load_settings(path)["price_basis"] == "bucket"

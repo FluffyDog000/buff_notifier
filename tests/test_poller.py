@@ -90,6 +90,16 @@ def test_a_cheap_listing_is_alerted_once(env):
     assert env[0].recent_signals()[0]["sent"] == 1
 
 
+def test_insufficient_similar_sales_are_reported_without_a_signal(env):
+    client = Client(page(lot(1, 20, .13)), page(lot(2, 80, .161)))
+    p = poller(env, client)
+    p.cycle(NOW)
+    assert not TG.sent
+    assert env[0].get_status("valuation:5777") == "Недостаточно похожих продаж: 1 из 1 лотов"
+    p.cycle(NOW + timedelta(seconds=5))
+    assert len(TG.sent) == 1 and env[0].get_status("valuation:5777") is None
+
+
 def test_remote_listing_with_changing_suffix_is_alerted_once_across_restarts(env):
     first = lot(190, 80, 0.161)
     first['id'] = '1094400227-18DF-136074490'
