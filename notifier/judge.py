@@ -71,7 +71,8 @@ class Market:
         return self.whole_price
 
     def comparable(self, listing: Listing, phase: int | None,
-                   pattern: bool, unpainted: bool) -> tuple["Market", list[dict]]:
+                   pattern: bool, unpainted: bool, min_recent: int = 0,
+                   recent_days: float = 7.) -> tuple["Market", list[dict]]:
         group_key = (phase, listing.paint_seed if pattern else None)
         if group_key not in self.groups:
             eligible = [r for r in self.rows if (r.get("price") or 0) > 0
@@ -85,6 +86,13 @@ class Market:
         windows = [w for w in windows if w >= self.base_window]
         window = next((w for w in windows if len(within(matching, w))
                        >= BUCKET_MIN_SALES), windows[-1])
+        selected = within(matching, window)
+        recent = sum(1 for r in selected if r.get("age_days") is not None
+                     and 0 <= r["age_days"] <= recent_days)
+        if len(selected) < BUCKET_MIN_SALES or recent < min_recent:
+            # No trend can repair missing observations. Reject before the
+            # quadratic fit, retaining the same window/count for diagnostics.
+            return Market(selected, window, base_window=window), selected
         # Trend fitting is shared across listings with the same phase/seed/window.
         key = (phase, listing.paint_seed if pattern else None, window)
         if key not in self.prepared:
@@ -174,10 +182,11 @@ def judge(listing: Listing, name: str, market: Market, s: dict) -> Verdict:
 
     cost = listing.price * s["usd_per_buff"] * (1 + s["buff_fee"])
     lo = _bucket(listing.float_value) if listing.float_value is not None else None
-    market, comparable = market.comparable(listing, phase_index, pattern, unpainted)
     min_recent = s.get("min_recent_sales", 5)
     recent_days = s.get("recent_sales_days", 7.)
     percentile = s.get("recent_price_percentile", .25)
+    market, comparable = market.comparable(listing, phase_index, pattern, unpainted,
+                                          min_recent, recent_days)
     sample = PriceSample.build(comparable, min_recent, recent_days, percentile)
     band = f"{lo:.2f}–{lo + 0.01:.2f}" if lo is not None else "—"
     mode = s.get("price_basis", "min")

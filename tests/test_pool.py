@@ -221,3 +221,28 @@ def test_cleared_expired_marker_stays_cleared_on_restart(env):
         assert store.get_status("account:primary:session_expired") is None
     finally:
         pool.close()
+
+
+def test_worker_writes_queue_before_entering_sqlite(env):
+    store, _, envp = env
+    other = Store(envp.parent / "buff.db")
+    mid = store.measurement("queued-write", 5, False, NOW)
+    # With no SQLite retries, the old per-connection locks fail immediately
+    # while another worker owns the transaction.
+    other.conn.execute("PRAGMA busy_timeout=0")
+    started = threading.Event()
+    def record():
+        started.set()
+        other.record_request(mid, NOW, "poll", "ok", 200)
+    try:
+        with ThreadPoolExecutor(1) as executor:
+            with store.lock, store.conn:
+                store.conn.execute("BEGIN IMMEDIATE")
+                future = executor.submit(record)
+                assert started.wait(2)
+                with pytest.raises(TimeoutError):
+                    future.result(timeout=.05)
+            future.result(timeout=2)
+        assert store.measurement_stats(NOW)["current"]["poll_ok"] == 1
+    finally:
+        other.conn.close()

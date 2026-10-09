@@ -10,11 +10,29 @@
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
+import weakref
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from .listings import Listing, signal_key
+
+# SQLite already serializes writers. Queue this process's connections before
+# entering SQLite, rather than making every worker retry its busy handler.
+_WRITE_LOCKS = weakref.WeakValueDictionary()
+_LOCKS_GUARD = threading.Lock()
+
+
+def _write_lock(path):
+    key = os.path.normcase(str(Path(path).resolve()))
+    with _LOCKS_GUARD:
+        lock = _WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _WRITE_LOCKS[key] = lock
+        return lock
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS watch (
@@ -121,14 +139,15 @@ def now_iso(now: datetime | None = None) -> str:
 class Store:
     def __init__(self, path: Path | str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.lock = _write_lock(path)
         self.conn = sqlite3.connect(str(path), timeout=30, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.executescript(SCHEMA)
-        self.lock = threading.Lock()
+        with self.lock:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.executescript(SCHEMA)
         # Preserve the history of already sent duplicates; only their earliest
         # row claims the common identity. The unique index is shared by workers.
-        with self.conn:
+        with self.lock, self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
             if "dedup_key" not in {r[1] for r in self.conn.execute("PRAGMA table_info(signals)")}:
                 self.conn.execute("ALTER TABLE signals ADD COLUMN dedup_key TEXT")

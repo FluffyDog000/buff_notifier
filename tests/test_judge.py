@@ -305,3 +305,14 @@ def test_float_purchase_price_is_compared_to_recent_ordinary_prices():
     neighbours += [dict(price=100.,age_days=12.,float_value=.164)] * 10
     v = judge(lot(90.,.154),NAME,Market.build(own+neighbours,16),dict(S,cheap_signal=False))
     assert v.kind is None, "ordinary prices have fallen to 80; paying 90 is no longer ordinary"
+
+
+@pytest.mark.parametrize("ages", [[1.] * 4, [1.] * 4 + [20.] * 40])
+def test_missing_fresh_comparables_are_rejected_before_trend_fitting(monkeypatch, ages):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("a trend cannot replace missing fresh sales")
+    monkeypatch.setattr("notifier.judge.to_today", unexpected)
+    rows = [dict(price=100., float_value=.164, age_days=age) for age in ages]
+    v = judge(lot(50., .164), NAME, Market.build(rows, 14), S)
+    assert v.kind is None and v.expected is None
+    assert v.reason.startswith("недостаточно данных")
